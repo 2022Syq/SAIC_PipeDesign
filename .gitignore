@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+
+# Generated planning and route artifacts
+outputs/
+planning_space*.json
+route_*.json
+route_*.html
+route_*.png
+slice_cache.npz
+
+# Local CAD input models
+#老的文件夹
+base/
+upload/ 
+#新的文件夹
+data/input/
+
+*.CATPart
+*.CATProduct
+*.CATDrawing
+*.catpart
+*.catproduct
+*.catdrawing
+*.step
+*.STEP
+*.stp
+*.STP
+*.igs
+*.IGS
+*.iges
+*.IGES
+*.docx
+# Temporary Word lock files
+~$*
+
+# Local editor files
+.vscode/

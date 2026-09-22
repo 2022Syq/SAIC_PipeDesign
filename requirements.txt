@@ -1,0 +1,5 @@
+numpy
+shapely
+matplotlib
+pywin32
+pycatia
