@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+"""
+三角网络通过occ_section.py得到X/Y截面线
+"""
 from __future__ import annotations
 
 from collections import defaultdict

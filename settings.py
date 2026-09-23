@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
-from pathlib import Path
 
+from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_DIR / "outputs"
