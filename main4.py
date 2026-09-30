@@ -61,8 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--radius",
         type=float,
-        default=float(getattr(settings, "PIPE_RADIUS", 25.0)),
-        help="Pipe outer radius in mm.",
+        default=None,
+        help="Override the core pipe outer radius in mm.",
     )
     parser.add_argument(
         "--visible",
@@ -427,7 +427,10 @@ def main() -> None:
     print(f"ENGINEERING_RESULT_JSON: {args.input}")
     print(f"selected route: case{index} {route.get('name')}")
     print(f"output: {output}")
-    create_catia_part(route, output, args.radius, args.visible, args.centerline_only)
+    radius = args.radius
+    if radius is None:
+        radius = float(route.get("core_outer_radius", getattr(settings, "PIPE_RADIUS", 25.0)))
+    create_catia_part(route, output, radius, args.visible, args.centerline_only)
     print("=== Done ===")
 
 

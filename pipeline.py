@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Measure CATIA helper points, update settings.py, then run "
-            "main1.py, main2.py and main3.py in order."
+            "main1.py, main2.py, main3.py and main4.py in order."
         )
     )
     parser.add_argument("--body", default="point", help='CATIA point set. Default: "point".')
@@ -28,6 +28,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal", default="GOAL", help="CATIA GOAL point name.")
     parser.add_argument("--start-dir", default="START_DIR_POINT", help="CATIA start-direction point name.")
     parser.add_argument("--goal-dir", default="GOAL_DIR_POINT", help="CATIA goal-direction point name.")
+    parser.add_argument("--route-index", type=int, default=1, help="1-based engineered route for the CATIA stage.")
+    parser.add_argument("--catia-visible", action="store_true", help="Show CATIA during the final modeling stage.")
+    parser.add_argument("--centerline-only", action="store_true", help="Create only the CATIA centerline in the final stage.")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -80,12 +83,19 @@ def point_stage_command(args: argparse.Namespace) -> list[str]:
 
 def pipeline_stages(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
     python_script = lambda name: [sys.executable, "-u", str(PROJECT_DIR / name)]
-    return [
+    stages = [
         ("CATIA helper points -> settings.py", point_stage_command(args)),
         ("X/Y planning-space sections", python_script("main1.py")),
         ("Joint X/Y route search", python_script("main2.py")),
         ("Engineering route reconstruction", python_script("main3.py")),
     ]
+    catia_command = python_script("main4.py") + ["--route-index", str(int(args.route_index))]
+    if args.catia_visible:
+        catia_command.append("--visible")
+    if args.centerline_only:
+        catia_command.append("--centerline-only")
+    stages.append(("CATIA engineered route modeling", catia_command))
+    return stages
 
 
 def display_command(command: list[str]) -> str:

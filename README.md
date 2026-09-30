@@ -11,9 +11,10 @@ The workflow has these stages:
 5. `main4.py` creates a CATIA CATPart from one engineered pipe route using line and arc centerline segments.
 6. `main_point.py` measures four CATIA helper points for route endpoint settings.
 
-`pipeline.py` runs `main_point.py`, `main1.py`, `main2.py`, and `main3.py` in
-that order. The measured CATIA helper points are written to `settings.py`
-before planning starts.
+`pipeline.py` runs `main_point.py`, `main1.py`, `main2.py`, `main3.py`, and
+`main4.py` in that order. The measured CATIA helper points are written to
+`settings.py` before planning starts. Use `--centerline-only` when the final
+CATIA stage should create only the route centerline.
 
 ## Project Layout
 
@@ -29,7 +30,7 @@ before planning starts.
 - `main3.py`: engineering pipe reconstruction and final HTML viewer.
 - `main4.py`: CATIA CATPart export for a selected engineered route, preserving the line/arc structure from `main3.py`.
 - `main_point.py`: reads helper points from a CATIA geometrical set and prints `settings.py` endpoint coordinates.
-- `pipeline.py`: runs point measurement, planning-space generation, route search, and engineering reconstruction.
+- `pipeline.py`: runs point measurement, planning-space generation, route search, engineering reconstruction, and CATIA modeling.
 - `upload.py`: converts uploaded Part files to IGES files for `main1.py`.
 
 ## Environment
@@ -63,6 +64,9 @@ to `base/`. Existing `.igs` files are kept unless `--overwrite` is used.
 `main4.py` requires CATIA and `pywin32`. Route selection uses `--case1` to `--case5`, or `--route-index` / `--route-name`.
 
 `main_point.py` requires CATIA and `pycatia`. By default it reads the geometrical set named `point` from the active CATPart and updates the four active coordinate assignments in `settings.py`. Use `--no-write-settings` for print-only mode, `--documents` to list open CATIA documents, or `--document` to select a specific CATPart.
+
+The `constraint-update` branch records its air-conditioning pipe constraint
+changes in [doc/版本说明-constraint-update.md](doc/版本说明-constraint-update.md).
 
 ## Notes
 
