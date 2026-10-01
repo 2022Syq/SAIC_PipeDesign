@@ -102,7 +102,7 @@ def turn_angle_degrees(prev_pt: np.ndarray, vertex: np.ndarray, next_pt: np.ndar
 
 
 def merge_small_turns(path: np.ndarray, minimum_turn_deg: float) -> np.ndarray:
-    """Remove control points whose direction change is below the hard limit."""
+    """Remove small interior turns without changing the endpoint directions."""
     points = remove_close_points(np.asarray(path, dtype=float), 1e-6)
     if len(points) <= 2:
         return points
@@ -111,6 +111,10 @@ def merge_small_turns(path: np.ndarray, minimum_turn_deg: float) -> np.ndarray:
         changed = False
         keep = [points[0]]
         for index in range(1, len(points) - 1):
+            # 两端相邻控制点定义用户指定的切向，不能按小角度抖动删除。
+            if index == 1 or index == len(points) - 2:
+                keep.append(points[index])
+                continue
             angle = turn_angle_degrees(points[index - 1], points[index], points[index + 1])
             if angle + 1e-6 < float(minimum_turn_deg):
                 changed = True
@@ -119,6 +123,47 @@ def merge_small_turns(path: np.ndarray, minimum_turn_deg: float) -> np.ndarray:
         keep.append(points[-1])
         points = np.asarray(keep, dtype=float)
     return points
+
+
+def adjust_endpoint_small_turns(path: np.ndarray, minimum_turn_deg: float) -> np.ndarray:
+    """Slide a small end bend along its prescribed tangent to the minimum angle."""
+    points = np.asarray(path, dtype=float).copy()
+    if len(points) < 4:
+        return points
+    for endpoint, anchor, connector in ((0, 1, 2), (-1, -2, -3)):
+        turn = turn_angle_degrees(points[endpoint], points[anchor], points[connector])
+        if not 1e-3 <= turn < minimum_turn_deg:
+            continue
+        direction = norm(points[anchor] - points[endpoint])
+        offset = points[connector] - points[endpoint]
+        axial = float(np.dot(offset, direction))
+        lateral = float(np.linalg.norm(offset - axial * direction))
+        # 30 mm 是规划锚点长度，不是成形端部直线硬下限。只沿原切向移动
+        # 转弯控制点，使圆角达到可制造最小弯角；端点与方向完全保持。
+        distance = axial - lateral / math.tan(math.radians(minimum_turn_deg))
+        if distance > 1e-6:
+            points[anchor] = points[endpoint] + distance * direction
+    return points
+
+
+def physical_bends(segments: list[dict]) -> list[dict]:
+    """Group contiguous pieces of the same circle into one manufacturing bend."""
+    bends = []
+    for index, segment in enumerate(segments):
+        if segment.get("type") != "arc":
+            continue
+        if (bends and bends[-1]["last_segment"] == index - 1
+                and dist(bends[-1]["center"], segment["center"]) < 1e-5
+                and abs(bends[-1]["radius"] - float(segment["radius"])) < 1e-6):
+            bends[-1]["last_segment"] = index
+            bends[-1]["angle_deg"] += abs(float(segment["angle_deg"]))
+        else:
+            bends.append({
+                "first_segment": index, "last_segment": index,
+                "center": segment["center"], "radius": float(segment["radius"]),
+                "angle_deg": abs(float(segment["angle_deg"])),
+            })
+    return bends
 
 
 def project_point_to_path(point, path: np.ndarray) -> tuple[float, float]:
@@ -154,22 +199,29 @@ def validate_route_constraints(path: np.ndarray, engineered: dict, profile: dict
             "minimum_mm": profile["minimum_bend_radius"],
         })
 
-    # 相邻弯之间的直线段按弧段之间的 line 长度检查。
-    last_arc = None
-    for index, segment in enumerate(engineered.get("segments", [])):
-        if segment.get("type") == "arc":
-            if last_arc is not None:
-                line_length = 0.0
-                for middle in engineered["segments"][last_arc + 1:index]:
-                    if middle.get("type") == "line":
-                        line_length += dist(middle["start"], middle["end"])
-                required = profile.get("straight_minimum")
-                recommended = profile.get("straight_recommended")
-                if required is not None and line_length + 1e-6 < float(required):
-                    hard_failures.append({"rule": "bend_spacing", "actual_mm": line_length, "minimum_mm": float(required)})
-                elif recommended is not None and line_length < float(recommended):
-                    warnings.append({"rule": "bend_spacing", "actual_mm": line_length, "recommended_mm": float(recommended)})
-            last_arc = index
+    # 验收真实成形弯角，不能以控制点已简化代替验收；同圆分弧仍是一个弯。
+    bends = physical_bends(engineered.get("segments", []))
+    minimum_bend_angle = float(getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0))
+    recommended_bend_angle = float(getattr(settings, "BEND_ANGLE_RECOMMENDED_DEG", 10.0))
+    for index, bend in enumerate(bends):
+        if bend["angle_deg"] + 1e-6 < minimum_bend_angle:
+            hard_failures.append({"rule": "bend_angle", "bend_index": index,
+                                  "actual_deg": bend["angle_deg"], "minimum_deg": minimum_bend_angle})
+        elif bend["angle_deg"] + 1e-6 < recommended_bend_angle:
+            warnings.append({"rule": "bend_angle", "bend_index": index,
+                             "actual_deg": bend["angle_deg"], "recommended_deg": recommended_bend_angle})
+    for left, right in zip(bends[:-1], bends[1:]):
+        line_length = sum(
+            dist(middle["start"], middle["end"])
+            for middle in engineered["segments"][left["last_segment"] + 1:right["first_segment"]]
+            if middle.get("type") == "line"
+        )
+        required = profile.get("straight_minimum")
+        recommended = profile.get("straight_recommended")
+        if required is not None and line_length + 1e-6 < float(required):
+            hard_failures.append({"rule": "bend_spacing", "actual_mm": line_length, "minimum_mm": float(required)})
+        elif recommended is not None and line_length < float(recommended):
+            warnings.append({"rule": "bend_spacing", "actual_mm": line_length, "recommended_mm": float(recommended)})
 
     # 焊点、阀座和铝套位置由 settings 明确提供后才执行，不从 CATProduct 猜测。
     for point in getattr(settings, "WELD_POINTS", []):
@@ -269,8 +321,73 @@ def validate_route_constraints(path: np.ndarray, engineered: dict, profile: dict
         "active_spec": profile["active_spec"],
         "minimum_bend_radius": profile["minimum_bend_radius"],
         "minimum_arc_radius": minimum_radius,
+        "minimum_bend_angle_deg": minimum_bend_angle,
+        "minimum_actual_bend_angle_deg": min((bend["angle_deg"] for bend in bends), default=None),
         "aluminum_sleeve_axis_clearance_recommended": float(getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_RECOMMENDED", 80.0)),
         "aluminum_sleeve_axis_clearance_minimum": float(getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_MINIMUM", 65.0)),
+    }
+
+
+def validate_engineered_geometry(segments: list[dict], start, goal, start_direction, goal_direction) -> dict:
+    """Measure the actual line/arc geometry, including endpoint and G1 continuity."""
+    position_tolerance = 1e-5
+    angle_tolerance = 1e-4
+
+    def tangent(segment: dict, at_end: bool) -> np.ndarray:
+        a = np.asarray(segment["start"], dtype=float)
+        b = np.asarray(segment["end"], dtype=float)
+        if segment["type"] == "line":
+            return norm(b - a)
+        center = np.asarray(segment["center"], dtype=float)
+        normal = norm(np.cross(a - center, b - center))
+        return norm(np.cross(normal, (b if at_end else a) - center))
+
+    def angle(a, b) -> float:
+        a, b = norm(a), norm(b)
+        if float(np.linalg.norm(a)) < 1e-9 or float(np.linalg.norm(b)) < 1e-9:
+            return 180.0
+        return float(math.degrees(math.atan2(float(np.linalg.norm(np.cross(a, b))), float(np.dot(a, b)))))
+
+    if not segments:
+        return {"valid": False, "violations": [{"rule": "empty_geometry"}]}
+
+    start_error = dist(segments[0]["start"], start)
+    goal_error = dist(segments[-1]["end"], goal)
+    start_angle = angle(tangent(segments[0], False), start_direction)
+    goal_angle = angle(tangent(segments[-1], True), goal_direction)
+    joints = [
+        {
+            "after_segment": index,
+            "gap_mm": dist(left["end"], right["start"]),
+            "tangent_error_deg": angle(tangent(left, True), tangent(right, False)),
+        }
+        for index, (left, right) in enumerate(zip(segments[:-1], segments[1:]), start=1)
+    ]
+    violations = []
+    for side, error, tangent_error in (("start", start_error, start_angle), ("goal", goal_error, goal_angle)):
+        if error > position_tolerance:
+            violations.append({"rule": "endpoint_position", "side": side, "error_mm": error})
+        if tangent_error > angle_tolerance:
+            violations.append({"rule": "endpoint_direction", "side": side, "error_deg": tangent_error})
+    for joint in joints:
+        if joint["gap_mm"] > position_tolerance:
+            violations.append({"rule": "joint_gap", **joint})
+        if joint["tangent_error_deg"] > angle_tolerance:
+            violations.append({"rule": "joint_tangent", **joint})
+    return {
+        "valid": not violations,
+        "position_tolerance_mm": position_tolerance,
+        "angle_tolerance_deg": angle_tolerance,
+        "start_position_error_mm": start_error,
+        "goal_position_error_mm": goal_error,
+        "start_tangent_error_deg": start_angle,
+        "goal_tangent_error_deg": goal_angle,
+        "start_straight_length_mm": dist(segments[0]["start"], segments[0]["end"]) if segments[0]["type"] == "line" else 0.0,
+        "goal_straight_length_mm": dist(segments[-1]["start"], segments[-1]["end"]) if segments[-1]["type"] == "line" else 0.0,
+        "max_joint_gap_mm": max((joint["gap_mm"] for joint in joints), default=0.0),
+        "max_joint_tangent_error_deg": max((joint["tangent_error_deg"] for joint in joints), default=0.0),
+        "joints": joints,
+        "violations": violations,
     }
 
 
@@ -667,13 +784,8 @@ def build_line_arc_route(
                 "point": guide[i].tolist(),
             })
 
-        if i == 1 or i == len(guide) - 2:
-            if dist(current, guide[i]) > 1e-6:
-                segments.append({"type": "line", "start": current.tolist(), "end": guide[i].tolist()})
-                sampled.append(guide[i])
-                current = guide[i]
-            continue
-
+        # 首末锚点也必须圆角，否则 30 mm 方向直线与后续导引线之间会留下尖角。
+        # 圆角沿已有端部直线切入，不移动端点，也不改变其切向。
         fillet = fillet_corner(guide[i - 1], guide[i], guide[i + 1], radius, max_arc_deg, sample_deg)
         if fillet is None:
             if dist(current, guide[i]) > 1e-6:
@@ -930,9 +1042,9 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         goal = guide[-1]
         # main2 already builds a protected endpoint chain:
         # endpoint -> 30 mm tangent anchor -> direction-filtered connector.
-        # Keep that chain locked, and let the clearance graph choose only the
-        # middle portion. Otherwise main3 can delete the connector and create
-        # an immediate hard turn right after the endpoint anchor.
+        # Preserve its connector while choosing the middle portion. The anchor
+        # may subsequently slide along its prescribed tangent for a small bend;
+        # every resulting line/arc candidate still undergoes clearance checks.
         start_count = max(2, min(start_count, len(guide)))
         goal_count = max(2, min(goal_count, len(guide) - start_count + 1))
         middle_start = start_count - 1
@@ -962,7 +1074,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
             control = simplify_to_max_points(control, max_turn_count + 2)
         control_before_s_bend = control.copy()
 
-    # 5 度以下的几何抖动不能形成独立工艺弯，直接合并到相邻直线。
+    # 合并内部小角度抖动，保留决定起终点方向的首末控制点。
     control = merge_small_turns(
         control,
         float(getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0)),
@@ -986,6 +1098,10 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     )
     if len(fallback_control) <= max_turn_count + 2 and not np.array_equal(control_options[0], fallback_control):
         control_options.append(fallback_control)
+    control_options = [
+        adjust_endpoint_small_turns(option, float(getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0)))
+        for option in control_options
+    ]
 
     engineered = None
     used_radius = None
@@ -999,17 +1115,24 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                 params["arc_sample_angle_deg"],
                 params["min_corner_angle_deg"],
             )
-            clearance_ok = (
-                collision_model is None
-                or clearance_valid_path(collision_model, candidate["sampled_path"], allow_soft)
+            collision_report = (
+                joint_validate_path(collision_model, candidate["sampled_path"])
+                if collision_model is not None else None
             )
-            actual_radii = [
-                float(segment.get("radius", 0.0))
-                for segment in candidate["segments"]
-                if segment.get("type") == "arc"
-            ]
-            radius_ok = not actual_radii or min(actual_radii) + 1e-6 >= minimum_radius
-            if candidate["corner_angle_valid"] and clearance_ok and radius_ok:
+            clearance_ok = collision_report is None or (
+                collision_report["hard_bad_segments"] == 0
+                and (allow_soft or collision_report["soft_bad_segments"] == 0)
+            )
+            geometry_report = validate_engineered_geometry(
+                candidate["segments"], settings.START, settings.GOAL,
+                np.asarray(settings.START_DIR_POINT) - np.asarray(settings.START),
+                np.asarray(settings.GOAL_DIR_POINT) - np.asarray(settings.GOAL),
+            )
+            constraint_report = validate_route_constraints(
+                candidate["sampled_path"], candidate, constraint_profile, collision_model=collision_model,
+            )
+            if (candidate["corner_angle_valid"] and clearance_ok
+                    and constraint_report["valid"] and geometry_report["valid"]):
                 engineered = candidate
                 used_radius = radius
                 used_control = control_candidate
@@ -1020,22 +1143,13 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         raise RuntimeError(
             f"{route_name}: no clearance-safe arc reconstruction exists with "
             f"main_turn_count<={max_turn_count}, radius>={minimum_radius:.1f} mm, "
-            f"and corner_angle>={params['min_corner_angle_deg']:.1f} deg"
+            f"corner_angle>={params['min_corner_angle_deg']:.1f} deg, "
+            f"bend_angle>={float(getattr(settings, 'BEND_ANGLE_MINIMUM_DEG', 5.0)):.1f} deg, "
+            "manufacturing spacing, and continuous endpoint-aligned geometry"
         )
     control = used_control
     control_before_s_bend = used_control
     sampled = engineered["sampled_path"]
-    constraint_report = validate_route_constraints(
-        sampled,
-        engineered,
-        constraint_profile,
-        collision_model=collision_model,
-    )
-    if not constraint_report["valid"]:
-        raise RuntimeError(
-            f"{route_name}: engineering constraints failed: "
-            f"{constraint_report['hard_failures']}"
-        )
     tube = tube_mesh(
         sampled,
         float(getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", constraint_profile["envelope_radius"])),
@@ -1091,6 +1205,8 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "corner_angle_valid": bool(engineered["corner_angle_valid"]),
         "corner_angle_violations": engineered["corner_angle_violations"],
         "constraint_report": constraint_report,
+        "geometry_report": geometry_report,
+        "collision_report": collision_report,
         "hanger_distance": hanger_report,
         "hanger_valid": bool(hanger_report["all_within_range"]),
     }

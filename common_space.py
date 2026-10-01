@@ -1137,7 +1137,7 @@ def export_planning_space_html(space: dict, settings, output: Path) -> None:
   </div>
   <div id="plot"></div>
   <script>
-// Python 将 __DATA__ 替换为内嵌的规划空间 JSON。
+// 下方常量由 Python 写入内嵌的规划空间 JSON。
 const DATA = __DATA__;
 const traces = [];
 

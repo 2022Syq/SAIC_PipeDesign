@@ -2,7 +2,6 @@ __pycache__/
 *.py[cod]
 
 # Generated planning and route artifacts
-outputs/
 planning_space*.json
 route_*.json
 route_*.html
@@ -16,6 +15,10 @@ upload/
 #新的文件夹
 data/input/
 
+#所有文件
+doc/
+#输出
+outputs/
 *.CATPart
 *.CATProduct
 *.CATDrawing
@@ -36,3 +39,7 @@ data/input/
 
 # Local editor files
 .vscode/
+
+#特定新增的untrack
+skills-lock.json
+.agents/
