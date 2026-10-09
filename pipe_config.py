@@ -1,0 +1,236 @@
+"""Configuration models for a multi-pipe routing run.
+
+The single-pipe pipeline keeps its values in :mod:`settings`.  Multi-pipe
+runs instead carry endpoint data in a JSON file so that reading one pipe does
+not overwrite the coordinates of another.  This module owns the small amount
+of validation needed at that boundary and resolves an outside radius from the
+existing ``settings.PIPE_SPECS`` table.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import settings
+
+
+Vector3 = tuple[float, float, float]
+
+
+def _vector(value: Any, field_name: str) -> Vector3:
+    """Validate and normalize one three-dimensional point."""
+    if isinstance(value, (str, bytes, Mapping)):
+        raise ValueError(f"{field_name} must be a sequence of three finite numbers")
+    try:
+        size = len(value)
+    except TypeError as exc:
+        raise ValueError(f"{field_name} must be a sequence of three finite numbers") from exc
+    if size != 3:
+        raise ValueError(f"{field_name} must contain exactly three values")
+    result: list[float] = []
+    for index, component in enumerate(value):
+        if isinstance(component, bool):
+            raise ValueError(f"{field_name}[{index}] must be a finite number")
+        try:
+            number = float(component)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name}[{index}] must be a finite number") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{field_name}[{index}] must be a finite number")
+        result.append(number)
+    return tuple(result)  # type: ignore[return-value]
+
+
+def _number(value: Any, field_name: str, *, minimum: float | None = None) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be a finite number")
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}")
+    return number
+
+
+def _priority(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("priority must be an integer")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError("priority must be an integer")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("priority must be an integer") from exc
+    if isinstance(value, str) and str(result) != value.strip():
+        raise ValueError("priority must be an integer")
+    return result
+
+
+def spec_outer_radius(spec_id: str, specs: Mapping[str, Mapping[str, Any]] | None = None) -> float:
+    """Return the outside radius (mm) for a row in ``settings.PIPE_SPECS``."""
+    table = settings.PIPE_SPECS if specs is None else specs
+    if not isinstance(spec_id, str) or not spec_id.strip():
+        raise ValueError("pipe_spec must be a non-empty string")
+    if spec_id not in table:
+        raise ValueError(f"Unknown pipe spec: {spec_id}")
+    try:
+        diameter = _number(table[spec_id]["outer_diameter"], f"PIPE_SPECS[{spec_id}].outer_diameter", minimum=0.0)
+    except KeyError as exc:
+        raise ValueError(f"PIPE_SPECS[{spec_id}] has no outer_diameter") from exc
+    if diameter <= 0.0:
+        raise ValueError(f"PIPE_SPECS[{spec_id}].outer_diameter must be > 0")
+    return diameter / 2.0
+
+
+# Names used by callers that prefer the word ``radius`` to ``outer``.
+pipe_spec_radius = spec_outer_radius
+spec_radius = spec_outer_radius
+
+
+@dataclass(frozen=True)
+class PipeInstance:
+    """One configured route and its endpoint tangent reference points."""
+
+    pipe_id: str
+    start: Vector3
+    goal: Vector3
+    start_dir: Vector3
+    goal_dir: Vector3
+    pipe_spec: str
+    required_clearance: float = 0.0
+    priority: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pipe_id, str) or not self.pipe_id.strip():
+            raise ValueError("pipe_id must be a non-empty string")
+        object.__setattr__(self, "pipe_id", self.pipe_id.strip())
+        for name in ("start", "goal", "start_dir", "goal_dir"):
+            object.__setattr__(self, name, _vector(getattr(self, name), name))
+        if not isinstance(self.pipe_spec, str) or not self.pipe_spec.strip():
+            raise ValueError("pipe_spec must be a non-empty string")
+        object.__setattr__(self, "pipe_spec", self.pipe_spec.strip())
+        # Resolve here so a typo is reported while loading the run, not during
+        # a later clearance check.
+        spec_outer_radius(self.pipe_spec)
+        object.__setattr__(
+            self,
+            "required_clearance",
+            _number(self.required_clearance, "required_clearance", minimum=0.0),
+        )
+        object.__setattr__(self, "priority", _priority(self.priority))
+        if self.start == self.start_dir:
+            raise ValueError("start_dir must differ from start")
+        if self.goal == self.goal_dir:
+            raise ValueError("goal_dir must differ from goal")
+
+    @property
+    def outer_radius(self) -> float:
+        return spec_outer_radius(self.pipe_spec)
+
+    @property
+    def radius(self) -> float:
+        return self.outer_radius
+
+    @property
+    def spec_id(self) -> str:
+        return self.pipe_spec
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "PipeInstance":
+        if not isinstance(value, Mapping):
+            raise ValueError("each pipe entry must be a JSON object")
+        required = ("pipe_id", "start", "goal", "start_dir", "goal_dir", "pipe_spec")
+        missing = [name for name in required if name not in value]
+        if missing:
+            raise ValueError(f"pipe entry is missing required fields: {', '.join(missing)}")
+        return cls(
+            pipe_id=value["pipe_id"],
+            start=value["start"],
+            goal=value["goal"],
+            start_dir=value["start_dir"],
+            goal_dir=value["goal_dir"],
+            pipe_spec=value["pipe_spec"],
+            required_clearance=value.get("required_clearance", 0.0),
+            priority=value.get("priority", 0),
+        )
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """Validated configuration for one multi-pipe run."""
+
+    pipes: tuple[PipeInstance, ...]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        pipes = tuple(self.pipes)
+        if not pipes:
+            raise ValueError("run config must contain at least one pipe")
+        if any(not isinstance(pipe, PipeInstance) for pipe in pipes):
+            raise ValueError("run config pipes must be PipeInstance objects")
+        ids = [pipe.pipe_id for pipe in pipes]
+        if len(set(ids)) != len(ids):
+            duplicates = sorted({pipe_id for pipe_id in ids if ids.count(pipe_id) > 1})
+            raise ValueError(f"pipe_id values must be unique: {duplicates}")
+        object.__setattr__(self, "pipes", pipes)
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError("metadata must be a JSON object")
+
+    def ordered_pipes(self) -> tuple[PipeInstance, ...]:
+        """Return pipes in deterministic priority, then input order."""
+        ordered = sorted(enumerate(self.pipes), key=lambda item: (item[1].priority, item[0]))
+        return tuple(pipe for _, pipe in ordered)
+
+    @property
+    def pipe_instances(self) -> tuple[PipeInstance, ...]:
+        return self.pipes
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "RunConfig":
+        if not isinstance(value, Mapping):
+            raise ValueError("run config must be a JSON object")
+        raw_pipes = value.get("pipes")
+        if raw_pipes is None:
+            raise ValueError("run config must contain a 'pipes' array")
+        if isinstance(raw_pipes, (str, bytes)) or not isinstance(raw_pipes, Sequence):
+            raise ValueError("run config 'pipes' must be an array")
+        pipes = tuple(PipeInstance.from_dict(item) for item in raw_pipes)
+        metadata = {str(k): v for k, v in value.items() if k != "pipes"}
+        return cls(pipes=pipes, metadata=metadata)
+
+
+def load_run_config(path: str | Path) -> RunConfig:
+    """Read, parse, and validate a multi-pipe JSON configuration."""
+    config_path = Path(path)
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"unable to read run config {config_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in run config {config_path}: {exc.msg}") from exc
+    return RunConfig.from_dict(payload)
+
+
+read_run_config = load_run_config
+from_json = load_run_config
+
+
+__all__ = [
+    "PipeInstance",
+    "RunConfig",
+    "load_run_config",
+    "read_run_config",
+    "from_json",
+    "spec_outer_radius",
+    "pipe_spec_radius",
+    "spec_radius",
+]

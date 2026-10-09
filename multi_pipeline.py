@@ -270,4 +270,239 @@ __all__ = [
     "make_run_id",
     "run_from_config",
     "run_pipeline",
+    "run_multi_pipe",
+    "cli_main",
 ]
+
+
+def _pipe_value(pipe, name, default=None):
+    if isinstance(pipe, Mapping):
+        return pipe.get(name, default)
+    return getattr(pipe, name, default)
+
+
+def _shared_space_bounds(pipes: list[Any]) -> tuple[list[float], list[float], float]:
+    points = [
+        list(_pipe_value(pipe, name))
+        for pipe in pipes
+        for name in ("start", "goal")
+    ]
+    if not points:
+        raise ValueError("at least one pipe is required to build a shared space")
+    start = [min(point[index] for point in points) for index in range(3)]
+    goal = [max(point[index] for point in points) for index in range(3)]
+    radius = max(float(_pipe_value(pipe, "outer_radius")) for pipe in pipes)
+    return start, goal, radius
+
+
+def _temporary_run_settings(run_dir: Path, space_start, space_goal, radius):
+    import contextlib
+    import settings
+
+    names = {
+        "OUTPUT_DIR": run_dir,
+        "SPACE_JSON": run_dir / "planning_space.json",
+        "SPACE_CHECKPOINT_JSON": run_dir / "planning_space_checkpoint.json",
+        "SPACE_HTML": run_dir / "planning_space.html",
+        "BIDIR_RESULT_JSON": run_dir / "routes_guide.json",
+        "BIDIR_HTML": run_dir / "routes_guide.html",
+        "BIDIR_DISTANCE_PNG": run_dir / "routes_guide_distance.png",
+        "ENGINEERING_RESULT_JSON": run_dir / "routes_engineered.json",
+        "ENGINEERING_HTML": run_dir / "multi_route_engineered.html",
+        "START": list(space_start),
+        "GOAL": list(space_goal),
+        "PIPE_RADIUS": float(radius),
+        "ROUTE_MAX_ENVELOPE_RADIUS": float(radius),
+        "X_RANGE": None,
+    }
+    previous = {name: getattr(settings, name, None) for name in names}
+
+    @contextlib.contextmanager
+    def manager():
+        try:
+            for name, value in names.items():
+                setattr(settings, name, value)
+            yield settings
+        finally:
+            for name, value in previous.items():
+                setattr(settings, name, value)
+
+    return manager()
+
+
+def _write_pipe_result(pipe_dir: Path, stage: str, result: Any) -> Path:
+    path = pipe_dir / f"{stage}.json"
+    _write_json(path, result)
+    return path
+
+
+def _clearance_against_reserved(pipe, route, reserved, sample_step: float = 20.0) -> list[dict[str, Any]]:
+    from route_clearance import check_pipe_clearance
+
+    path = route.get("engineered_path") or route.get("path") or route
+    reports = []
+    for other_pipe, other_route in reserved:
+        reports.append(check_pipe_clearance(pipe, path, other_pipe, other_route, sample_step))
+    return reports
+
+
+def run_multi_pipe(
+    config_or_path: "RunConfig | str | Path",
+    *,
+    output_root: str | Path = "outputs",
+    run_id: str | None = None,
+    centerline_only: bool = False,
+    catia_visible: bool = False,
+    skip_catia: bool = False,
+) -> dict[str, Any]:
+    """Run the real sequential multi-pipe flow using the existing stages."""
+    if isinstance(config_or_path, (str, Path)):
+        from pipe_config import load_run_config
+
+        config = load_run_config(config_or_path)
+    else:
+        config = config_or_path
+    pipes = _config_pipes(config)
+    from main1 import build_shared_space
+    from main2 import DualSectionModel, export_html as export_guide_html, plan_pipe_routes, section_polygons
+    from main3 import engineer_pipe_route, export_engineering_html
+    from main4 import create_catia_part
+
+    space_start, space_goal, shared_radius = _shared_space_bounds(pipes)
+    resolved_run_id = _safe_component(run_id or make_run_id())
+    run_dir = Path(output_root).resolve() / resolved_run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    manifest = {
+        "run_id": resolved_run_id,
+        "status": "running",
+        "pipe_count": len(pipes),
+        "planning_order": [_pipe_id(pipe, index) for index, pipe in enumerate(pipes)],
+        "shared_space": {
+            "start_bound": space_start,
+            "goal_bound": space_goal,
+            "max_outer_radius": shared_radius,
+        },
+        "pipes": [],
+    }
+    _write_json(run_dir / "manifest.json", manifest)
+    reserved: list[tuple[Any, dict[str, Any]]] = []
+    guide_routes: list[dict[str, Any]] = []
+    engineered_routes: list[dict[str, Any]] = []
+    clearance_reports: list[dict[str, Any]] = []
+
+    try:
+        with _temporary_run_settings(run_dir, space_start, space_goal, shared_radius):
+            space = build_shared_space(space_start, space_goal, shared_radius, run_dir)
+            import settings
+
+            validation_extra = float(getattr(settings, "ENGINEERING_VALIDATION_EXTRA_CLEARANCE", 2.0))
+            collision_model = DualSectionModel(
+                section_polygons(space, "x", extra_clearance=validation_extra),
+                section_polygons(space, "y", extra_clearance=validation_extra),
+            )
+            for index, pipe in enumerate(pipes):
+                pipe_id = _pipe_id(pipe, index)
+                pipe_dir = run_dir / pipe_id
+                pipe_dir.mkdir(parents=True, exist_ok=False)
+                record = {"pipe_id": pipe_id, "priority": _pipe_value(pipe, "priority"), "status": "running"}
+                manifest["pipes"].append(record)
+
+                planning_result = plan_pipe_routes(space, pipe)
+                _write_pipe_result(pipe_dir, "planning", planning_result)
+                selected_guide = None
+                selected_engineered = None
+                selected_reports = None
+                failed_candidates = []
+                for candidate in planning_result["routes"]:
+                    guide_reports = _clearance_against_reserved(pipe, candidate, reserved)
+                    if any(not report["valid"] for report in guide_reports):
+                        failed_candidates.append({"name": candidate.get("name"), "stage": "planning", "clearance": guide_reports})
+                        continue
+                    try:
+                        engineered = engineer_pipe_route(
+                            candidate,
+                            pipe,
+                            color=candidate.get("color", "#2563eb"),
+                            collision_model=collision_model,
+                        )
+                    except Exception as exc:
+                        failed_candidates.append({"name": candidate.get("name"), "stage": "engineering", "reason": str(exc)})
+                        continue
+                    final_reports = _clearance_against_reserved(pipe, engineered, reserved)
+                    if any(not report["valid"] for report in final_reports):
+                        failed_candidates.append({"name": candidate.get("name"), "stage": "engineering", "clearance": final_reports})
+                        continue
+                    selected_guide = candidate
+                    selected_engineered = engineered
+                    selected_reports = guide_reports + final_reports
+                    break
+                if selected_guide is None or selected_engineered is None:
+                    record.update({"status": "failed", "failed_candidates": failed_candidates})
+                    _write_json(run_dir / "manifest.json", manifest)
+                    raise RuntimeError(f"{pipe_id}: no candidate route satisfies inter-pipe clearance")
+
+                _write_pipe_result(pipe_dir, "engineering", selected_engineered)
+                _write_pipe_result(pipe_dir, "clearance", selected_reports or [])
+                record.update({"status": "completed", "directory": str(pipe_dir), "failed_candidates": failed_candidates})
+                reserved.append((pipe, selected_engineered))
+                guide_routes.append(selected_guide)
+                engineered_routes.append(selected_engineered)
+                clearance_reports.extend(selected_reports or [])
+                _write_json(run_dir / "manifest.json", manifest)
+
+            guide_result = {"run_id": resolved_run_id, "routes": guide_routes}
+            engineered_result = {"run_id": resolved_run_id, "routes": engineered_routes}
+            _write_json(run_dir / "routes_guide.json", guide_result)
+            _write_json(run_dir / "routes_engineered.json", engineered_result)
+            _write_json(run_dir / "validation.json", {"reports": clearance_reports})
+            export_guide_html(guide_routes, run_dir / "routes_guide.html")
+            export_engineering_html(engineered_result, run_dir / "multi_route_engineered.html")
+
+            if not skip_catia:
+                catia_dir = run_dir / "catia"
+                catia_dir.mkdir(parents=True, exist_ok=True)
+                for pipe, route in reserved:
+                    output = catia_dir / f"{_pipe_id(pipe, 0)}.CATPart"
+                    create_catia_part(
+                        route,
+                        output,
+                        float(_pipe_value(pipe, "outer_radius")),
+                        bool(catia_visible),
+                        bool(centerline_only),
+                    )
+        manifest["status"] = "completed"
+    except Exception as exc:
+        manifest["status"] = "failed"
+        manifest["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        _write_json(run_dir / "manifest.json", manifest)
+        raise
+
+    _write_json(run_dir / "manifest.json", manifest)
+    return {"run_id": resolved_run_id, "run_dir": run_dir, "manifest": manifest, "routes": engineered_routes}
+
+
+def cli_main(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run sequential multi-pipe planning and CATIA export.")
+    parser.add_argument("config", type=Path, help="JSON file containing the pipe instances.")
+    parser.add_argument("--output-root", type=Path, default=Path("outputs"))
+    parser.add_argument("--run-id")
+    parser.add_argument("--centerline-only", action="store_true")
+    parser.add_argument("--catia-visible", action="store_true")
+    parser.add_argument("--skip-catia", action="store_true")
+    args = parser.parse_args(argv)
+    result = run_multi_pipe(
+        args.config,
+        output_root=args.output_root,
+        run_id=args.run_id,
+        centerline_only=args.centerline_only,
+        catia_visible=args.catia_visible,
+        skip_catia=args.skip_catia,
+    )
+    print(f"MULTI_PIPE_RUN: {result['run_dir']}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CATIA/CAD integration entry.
+    raise SystemExit(cli_main())

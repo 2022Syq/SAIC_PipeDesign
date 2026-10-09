@@ -2016,6 +2016,71 @@ Plotly.newPlot("plot", traces, {
     print(f"[HTML] saved: {output}")
 
 
+def plan_pipe_routes(space: dict, pipe=None) -> dict:
+    """Plan one configured pipe against an already-built planning space.
+
+    The legacy ``main()`` entry remains unchanged and still reads the single
+    pipe from ``settings.py``.  Multi-pipe orchestration calls this function
+    with a pipe object so endpoint coordinates are not written back globally.
+    """
+    def value(name, default=None):
+        if pipe is None:
+            return default
+        if isinstance(pipe, dict):
+            return pipe.get(name, default)
+        return getattr(pipe, name, default)
+
+    extra_clearance = float(getattr(settings, "MAIN2_EXTRA_CLEARANCE", 0.0))
+    if not 0.0 <= extra_clearance <= 20.0:
+        raise ValueError("MAIN2_EXTRA_CLEARANCE must be between 0 and 20 mm")
+    x_sections = section_polygons(space, "x", extra_clearance=extra_clearance)
+    y_sections = section_polygons(space, "y", extra_clearance=extra_clearance)
+    if not y_sections:
+        raise RuntimeError("planning space does not contain y_sections")
+    model = DualSectionModel(x_sections, y_sections)
+    validation_model = DualSectionModel(
+        section_polygons(space, "x"), section_polygons(space, "y")
+    )
+    start = np.asarray(value("start", space.get("start", settings.START)), dtype=float)
+    goal = np.asarray(value("goal", space.get("goal", settings.GOAL)), dtype=float)
+    start_dir_point = np.asarray(value("start_dir", settings.START_DIR_POINT), dtype=float)
+    goal_dir_point = np.asarray(value("goal_dir", settings.GOAL_DIR_POINT), dtype=float)
+    start_dir = norm(start_dir_point - start)
+    goal_dir = norm(goal_dir_point - goal)
+    pipe_id = value("pipe_id", None)
+    pipe_spec = value("pipe_spec", getattr(settings, "ACTIVE_PIPE_SPEC", ""))
+    pipe_radius = value("outer_radius", value("radius", getattr(settings, "PIPE_RADIUS", 25.0)))
+
+    routes = []
+    for profile in make_profiles():
+        route = build_joint_route(
+            profile, space, model, start, goal, start_dir, goal_dir,
+            validation_model=validation_model,
+        )
+        route["requested_extra_clearance"] = float(extra_clearance)
+        route["pipe_id"] = pipe_id
+        route["pipe_spec"] = pipe_spec
+        route["pipe_radius"] = float(pipe_radius)
+        if pipe_id:
+            route["name"] = f"{pipe_id}_{route['name']}"
+        routes.append(route)
+
+    default_route = routes[0]
+    return {
+        "method": "joint_xy_section_lattice_astar",
+        "pipe_id": pipe_id,
+        "pipe_spec": pipe_spec,
+        "pipe_radius": float(pipe_radius),
+        "space_json": str(space.get("source_json", "")),
+        "path": default_route["path"],
+        "logs": default_route["logs"],
+        "cost": default_route["cost"],
+        "valid_segments": 0 if default_route["hard_bad_segments"] or default_route["soft_bad_segments"] else max(0, len(default_route["path"]) - 1),
+        "total_segments": max(0, len(default_route["path"]) - 1),
+        "routes": routes,
+    }
+
+
 def main() -> None:
     t0 = time.time()
     print("=== Main2 Joint X/Y Section Lattice Planner ===")

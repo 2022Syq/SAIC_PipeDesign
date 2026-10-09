@@ -49,21 +49,32 @@ def cumulative_lengths(path: np.ndarray) -> np.ndarray:
     return np.asarray(values, dtype=float)
 
 
-def active_constraint_profile() -> dict:
+def active_constraint_profile(spec_id: str | None = None, envelope_radius: float | None = None, pipe_segments=None) -> dict:
     """Resolve the selected air-conditioning pipe rules for this run.
 
     The planning space still uses one conservative route envelope.  Segment
     assignments are carried in the output for the engineer's next test; until
     coordinates are supplied, engineering uses the active/default core spec.
     """
-    spec_id = str(getattr(settings, "ACTIVE_PIPE_SPEC", ""))
+    spec_id = str(spec_id or getattr(settings, "ACTIVE_PIPE_SPEC", ""))
     specs = getattr(settings, "PIPE_SPECS", {})
     if spec_id not in specs:
         raise ValueError(f"ACTIVE_PIPE_SPEC is not defined: {spec_id}")
     spec = dict(specs[spec_id])
     if spec.get("kind") != "metal":
         raise ValueError("ACTIVE_PIPE_SPEC must identify the continuous metal core")
-    spec_ids = sorted(getattr(settings, "selected_pipe_spec_ids", lambda: {spec_id})())
+    if pipe_segments is None:
+        spec_ids = sorted(getattr(settings, "selected_pipe_spec_ids", lambda: {spec_id})())
+    else:
+        spec_ids = {spec_id}
+        for segment in pipe_segments:
+            spec_ids.add(str(segment.get("core_spec", spec_id)))
+            if segment.get("cover_spec"):
+                spec_ids.add(str(segment["cover_spec"]))
+        unknown = spec_ids.difference(specs)
+        if unknown:
+            raise ValueError(f"Unknown pipe specs: {sorted(unknown)}")
+        spec_ids = sorted(spec_ids)
     # 当前运行按一个主动金属规格工程化；胶管规格先保留在分段元数据中，
     # 等工程师提供区间后再对局部中心线应用胶管半径。
     preferred = max(
@@ -73,7 +84,7 @@ def active_constraint_profile() -> dict:
     hard_min = float(spec.get("minimum_bend_radius", preferred))
     cover_ids = [
         str(segment.get("cover_spec"))
-        for segment in getattr(settings, "PIPE_SEGMENTS", [])
+        for segment in (getattr(settings, "PIPE_SEGMENTS", []) if pipe_segments is None else pipe_segments)
         if segment.get("cover_spec")
     ]
     return {
@@ -84,12 +95,16 @@ def active_constraint_profile() -> dict:
         "flexibility": spec.get("flexibility", "rigid"),
         "preferred_bend_radius": preferred,
         "minimum_bend_radius": hard_min,
-        "envelope_radius": float(getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", float(spec["outer_diameter"]) / 2.0)),
+        "envelope_radius": float(
+            envelope_radius
+            if envelope_radius is not None
+            else getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", float(spec["outer_diameter"]) / 2.0)
+        ),
         "core_outer_radius": float(spec["outer_diameter"]) / 2.0,
         "straight_recommended": spec.get("straight_recommended"),
         "straight_minimum": spec.get("straight_minimum"),
         "spec_ids": spec_ids,
-        "pipe_segments": list(getattr(settings, "PIPE_SEGMENTS", [])),
+        "pipe_segments": list(getattr(settings, "PIPE_SEGMENTS", []) if pipe_segments is None else pipe_segments),
     }
 
 
@@ -979,6 +994,14 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     guide = np.asarray(source_route["path"], dtype=float)
     guide = remove_close_points(guide, 1e-6)
     constraint_profile = params.get("constraint_profile") or active_constraint_profile()
+    route_start = np.asarray(params.get("start", settings.START), dtype=float)
+    route_goal = np.asarray(params.get("goal", settings.GOAL), dtype=float)
+    route_start_dir = np.asarray(
+        params.get("start_dir", settings.START_DIR_POINT), dtype=float
+    )
+    route_goal_dir = np.asarray(
+        params.get("goal_dir", settings.GOAL_DIR_POINT), dtype=float
+    )
 
     tangent_info = source_route.get("search", {}).get("endpoint_tangency", {})
     start_count = int(tangent_info.get("start", {}).get("curve_point_count", 0))
@@ -1124,9 +1147,9 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                 and (allow_soft or collision_report["soft_bad_segments"] == 0)
             )
             geometry_report = validate_engineered_geometry(
-                candidate["segments"], settings.START, settings.GOAL,
-                np.asarray(settings.START_DIR_POINT) - np.asarray(settings.START),
-                np.asarray(settings.GOAL_DIR_POINT) - np.asarray(settings.GOAL),
+                candidate["segments"], route_start, route_goal,
+                route_start_dir - route_start,
+                route_goal_dir - route_goal,
             )
             constraint_report = validate_route_constraints(
                 candidate["sampled_path"], candidate, constraint_profile, collision_model=collision_model,
@@ -1152,7 +1175,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     sampled = engineered["sampled_path"]
     tube = tube_mesh(
         sampled,
-        float(getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", constraint_profile["envelope_radius"])),
+        float(params.get("pipe_radius", constraint_profile["envelope_radius"])),
         params["tube_segments"],
     )
     hanger_report = hanger_distance_report(
@@ -1163,6 +1186,9 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
 
     return {
         "name": route_name,
+        "pipe_id": params.get("pipe_id"),
+        "start": route_start.tolist(),
+        "goal": route_goal.tolist(),
         "color": color,
         "bend_radius": float(used_radius),
         "requested_bend_radius": float(preferred_radius),
@@ -1171,7 +1197,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "cover_spec": constraint_profile["cover_spec"],
         "pipe_spec_ids": constraint_profile["spec_ids"],
         "core_outer_radius": constraint_profile["core_outer_radius"],
-        "route_max_envelope_radius": float(getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", constraint_profile["envelope_radius"])),
+        "route_max_envelope_radius": float(params.get("pipe_radius", constraint_profile["envelope_radius"])),
         "pipe_segments": constraint_profile["pipe_segments"],
         "max_bend_angle_deg": params["max_bend_angle_deg"],
         "arc_sample_angle_deg": params["arc_sample_angle_deg"],
@@ -1210,6 +1236,77 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "hanger_distance": hanger_report,
         "hanger_valid": bool(hanger_report["all_within_range"]),
     }
+
+
+def make_engineering_params(pipe=None, collision_model=None) -> dict:
+    """Build engineering parameters for the default or one multi-pipe instance.
+
+    The command-line single-pipe path keeps using ``settings.py``.  A
+    multi-pipe caller can provide an object with endpoint and specification
+    attributes without rewriting the global settings file.
+    """
+    def value(name, default=None):
+        if pipe is None:
+            return default
+        if isinstance(pipe, dict):
+            return pipe.get(name, default)
+        return getattr(pipe, name, default)
+
+    spec_id = value("pipe_spec", getattr(settings, "ACTIVE_PIPE_SPEC", ""))
+    radius = value("outer_radius", None)
+    if radius is None:
+        radius = value("radius", None)
+    profile = active_constraint_profile(
+        spec_id=spec_id,
+        envelope_radius=float(radius) if radius is not None else None,
+        pipe_segments=value("pipe_segments", None),
+    )
+    if radius is None:
+        radius = profile["envelope_radius"]
+    return {
+        "constraint_profile": profile,
+        "bend_radius": profile["preferred_bend_radius"],
+        "max_bend_angle_deg": float(getattr(settings, "ENGINEERING_MAX_BEND_ANGLE_DEG", 45.0)),
+        "min_corner_angle_deg": float(getattr(settings, "ENGINEERING_MAX_BEND_ANGLE_DEG", 90.0)),
+        "arc_sample_angle_deg": float(getattr(settings, "ENGINEERING_ARC_SAMPLE_ANGLE_DEG", 4.0)),
+        "max_turn_count": int(getattr(settings, "ENGINEERING_MAX_TURN_COUNT", 4)),
+        "min_bend_radius": profile["minimum_bend_radius"],
+        "bend_radius_step": float(getattr(settings, "ENGINEERING_BEND_RADIUS_STEP", 10.0)),
+        "collision_model": collision_model,
+        "simplify_tolerance": float(getattr(settings, "ENGINEERING_SIMPLIFY_TOLERANCE", 25.0)),
+        "z_tolerance": float(getattr(settings, "ENGINEERING_Z_SIMPLIFY_TOLERANCE", 80.0)),
+        "min_segment_length": float(getattr(settings, "ENGINEERING_MIN_SEGMENT_LENGTH", 40.0)),
+        "s_bend_min_turn_deg": float(getattr(settings, "ENGINEERING_S_BEND_MIN_TURN_DEG", 110.0)),
+        "s_bend_max_span": float(getattr(settings, "ENGINEERING_S_BEND_MAX_SPAN", 420.0)),
+        "s_bend_min_detour": float(getattr(settings, "ENGINEERING_S_BEND_MIN_DETOUR", 60.0)),
+        "wiggle_smooth_route_names": set(getattr(settings, "ENGINEERING_WIGGLE_SMOOTH_ROUTE_NAMES", [])),
+        "wiggle_min_turn_deg": float(getattr(settings, "ENGINEERING_WIGGLE_MIN_TURN_DEG", 55.0)),
+        "wiggle_max_span": float(getattr(settings, "ENGINEERING_WIGGLE_MAX_SPAN", 430.0)),
+        "wiggle_min_detour": float(getattr(settings, "ENGINEERING_WIGGLE_MIN_DETOUR", 45.0)),
+        "pipe_radius": float(radius),
+        "tube_segments": int(getattr(settings, "ENGINEERING_TUBE_SEGMENTS", 16)),
+        "hanger_points": value("hanger_points", settings_hanger_points(settings)),
+        "hanger_distance_range": float(value(
+            "hanger_distance_range", getattr(settings, "HANGER_POINT_DISTANCE_RANGE", 100.0)
+        )),
+        "pipe_id": value("pipe_id", None),
+        "start": value("start", settings.START),
+        "goal": value("goal", settings.GOAL),
+        "start_dir": value("start_dir", settings.START_DIR_POINT),
+        "goal_dir": value("goal_dir", settings.GOAL_DIR_POINT),
+    }
+
+
+def engineer_pipe_route(source_route: dict, pipe, color: str, collision_model=None) -> dict:
+    """Engineer one route with a multi-pipe instance's endpoints and radius."""
+    pipe_id = pipe.get("pipe_id") if isinstance(pipe, dict) else getattr(pipe, "pipe_id", "pipe")
+    source = dict(source_route)
+    source_name = str(source_route.get("name", "route"))
+    source["name"] = source_name if source_name.startswith(f"{pipe_id}_") else f"{pipe_id}_{source_name}"
+    params = make_engineering_params(pipe, collision_model=collision_model)
+    result = engineer_route(source, color, params)
+    result["pipe_id"] = str(pipe_id)
+    return result
 
 
 def export_engineering_html(result: dict, output: Path) -> None:
