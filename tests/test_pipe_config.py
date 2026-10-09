@@ -3,7 +3,13 @@ import json
 import pytest
 
 import settings
-from pipe_config import PipeInstance, RunConfig, load_run_config, spec_outer_radius
+from pipe_config import (
+    PipeInstance,
+    RunConfig,
+    load_run_config,
+    merge_measured_points,
+    spec_outer_radius,
+)
 
 
 def pipe_data(pipe_id="pipe_01", priority=1, **overrides):
@@ -65,3 +71,89 @@ def test_load_run_config_rejects_invalid_json(tmp_path):
     path.write_text("{", encoding="utf-8")
     with pytest.raises(ValueError, match="invalid JSON"):
         load_run_config(path)
+
+
+def test_merge_measured_points_replaces_only_coordinates(tmp_path):
+    config = RunConfig.from_dict({"pipes": [pipe_data("pipe_01", priority=7)]})
+    measured = {
+        "body": "Part1(Route_Point)",
+        "pipes": [
+            {
+                "pipe_id": "pipe_01",
+                "start": [10, 20, 30],
+                "goal": [110, 20, 30],
+                "start_dir": [40, 20, 30],
+                "goal_dir": [140, 20, 30],
+                "point_names": {"start": "PIPE_01_START"},
+            }
+        ],
+    }
+    path = tmp_path / "measured.json"
+    path.write_text(json.dumps(measured), encoding="utf-8")
+
+    merged = merge_measured_points(config, path)
+    pipe = merged.pipes[0]
+    assert pipe.start == (10.0, 20.0, 30.0)
+    assert pipe.goal_dir == (140.0, 20.0, 30.0)
+    assert pipe.pipe_spec == "metal_19_05"
+    assert pipe.required_clearance == 20.0
+    assert pipe.priority == 7
+
+
+def test_merge_measured_points_requires_exact_pipe_ids():
+    config = RunConfig.from_dict({"pipes": [pipe_data("pipe_01")]})
+    measured = {
+        "pipes": [
+            {
+                "pipe_id": "PIPE_01",
+                "start": [0, 0, 0],
+                "goal": [100, 0, 0],
+                "start_dir": [20, 0, 0],
+                "goal_dir": [120, 0, 0],
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="do not match run config"):
+        merge_measured_points(config, measured)
+
+
+def test_load_run_config_can_fill_coordinate_free_spec_config(tmp_path):
+    config_path = tmp_path / "specs.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "pipes": [
+                    {
+                        "pipe_id": "PIPE_01",
+                        "pipe_spec": "metal_19_05",
+                        "required_clearance": 25,
+                        "priority": 2,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    points_path = tmp_path / "points.json"
+    points_path.write_text(
+        json.dumps(
+            {
+                "pipes": [
+                    {
+                        "pipe_id": "PIPE_01",
+                        "start": [0, 0, 0],
+                        "goal": [100, 0, 0],
+                        "start_dir": [20, 0, 0],
+                        "goal_dir": [120, 0, 0],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_run_config(config_path, measured=points_path)
+    assert config.pipes[0].start == (0.0, 0.0, 0.0)
+    assert config.pipes[0].pipe_spec == "metal_19_05"
+    assert config.pipes[0].required_clearance == 25.0
+    assert config.pipes[0].priority == 2

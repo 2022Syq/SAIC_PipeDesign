@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
-from multi_pipeline import StageAdapterRequired, run_pipeline
+from multi_pipeline import StageAdapterRequired, cli_main, run_pipeline
 
 
 @dataclass
@@ -72,3 +73,38 @@ def test_default_stage_explains_required_injection(tmp_path):
     manifest = json.loads((tmp_path / "adapter-error" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "failed"
     assert manifest["error"]["type"] == "StageAdapterRequired"
+
+
+def test_cli_passes_points_file_to_multi_run(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(config, **kwargs):
+        calls.append((config, kwargs))
+        return {"run_dir": tmp_path / "run-001"}
+
+    monkeypatch.setattr("multi_pipeline.run_multi_pipe", fake_run)
+    assert cli_main(
+        [
+            "config.json",
+            "--points",
+            "measured.json",
+            "--output-root",
+            str(tmp_path),
+            "--run-id",
+            "run-001",
+            "--skip-catia",
+        ]
+    ) == 0
+    assert calls == [
+        (
+            Path("config.json"),
+            {
+                "points_path": Path("measured.json"),
+                "output_root": tmp_path,
+                "run_id": "run-001",
+                "centerline_only": False,
+                "catia_visible": False,
+                "skip_catia": True,
+            },
+        )
+    ]

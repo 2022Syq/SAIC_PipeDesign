@@ -349,6 +349,7 @@ def _clearance_against_reserved(pipe, route, reserved, sample_step: float = 20.0
 def run_multi_pipe(
     config_or_path: "RunConfig | str | Path",
     *,
+    points_path: str | Path | None = None,
     output_root: str | Path = "outputs",
     run_id: str | None = None,
     centerline_only: bool = False,
@@ -359,9 +360,13 @@ def run_multi_pipe(
     if isinstance(config_or_path, (str, Path)):
         from pipe_config import load_run_config
 
-        config = load_run_config(config_or_path)
+        config = load_run_config(config_or_path, measured=points_path)
     else:
         config = config_or_path
+    if points_path is not None and not isinstance(config_or_path, (str, Path)):
+        from pipe_config import merge_measured_points
+
+        config = merge_measured_points(config, points_path)
     pipes = _config_pipes(config)
     from main1 import build_shared_space
     from main2 import DualSectionModel, export_html as export_guide_html, plan_pipe_routes, section_polygons
@@ -377,6 +382,7 @@ def run_multi_pipe(
         "status": "running",
         "pipe_count": len(pipes),
         "planning_order": [_pipe_id(pipe, index) for index, pipe in enumerate(pipes)],
+        "points_source": str(Path(points_path).resolve()) if points_path is not None else None,
         "shared_space": {
             "start_bound": space_start,
             "goal_bound": space_goal,
@@ -486,6 +492,12 @@ def cli_main(argv=None) -> int:
 
     parser = argparse.ArgumentParser(description="Run sequential multi-pipe planning and CATIA export.")
     parser.add_argument("config", type=Path, help="JSON file containing the pipe instances.")
+    parser.add_argument(
+        "--points",
+        dest="points_path",
+        type=Path,
+        help="JSON written by main_point.py --multi-output; replaces endpoint coordinates in the config.",
+    )
     parser.add_argument("--output-root", type=Path, default=Path("outputs"))
     parser.add_argument("--run-id")
     parser.add_argument("--centerline-only", action="store_true")
@@ -494,6 +506,7 @@ def cli_main(argv=None) -> int:
     args = parser.parse_args(argv)
     result = run_multi_pipe(
         args.config,
+        points_path=args.points_path,
         output_root=args.output_root,
         run_id=args.run_id,
         centerline_only=args.centerline_only,

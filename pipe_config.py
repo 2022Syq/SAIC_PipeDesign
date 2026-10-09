@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -206,18 +206,116 @@ class RunConfig:
         return cls(pipes=pipes, metadata=metadata)
 
 
-def load_run_config(path: str | Path) -> RunConfig:
-    """Read, parse, and validate a multi-pipe JSON configuration."""
+def _read_json_payload(path: str | Path, description: str) -> Any:
     config_path = Path(path)
     try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        return json.loads(config_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise
     except (OSError, UnicodeError) as exc:
-        raise ValueError(f"unable to read run config {config_path}: {exc}") from exc
+        raise ValueError(f"unable to read {description} {config_path}: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid JSON in run config {config_path}: {exc.msg}") from exc
+        raise ValueError(f"invalid JSON in {description} {config_path}: {exc.msg}") from exc
+
+
+def _measured_by_id(payload: Any) -> dict[str, Mapping[str, Any]]:
+    measured_items = payload.get("pipes") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(payload, Mapping)
+        or isinstance(measured_items, (str, bytes))
+        or not isinstance(measured_items, Sequence)
+    ):
+        raise ValueError("measured points must contain a 'pipes' array")
+    measured_by_id: dict[str, Mapping[str, Any]] = {}
+    for item in measured_items:
+        if not isinstance(item, Mapping) or not item.get("pipe_id"):
+            raise ValueError("each measured point entry must contain pipe_id")
+        pipe_id = str(item["pipe_id"])
+        if pipe_id in measured_by_id:
+            raise ValueError(f"duplicate measured pipe_id: {pipe_id}")
+        measured_by_id[pipe_id] = item
+    return measured_by_id
+
+
+def _merge_measured_into_raw_config(config_payload: Any, measured_payload: Any) -> Mapping[str, Any]:
+    if not isinstance(config_payload, Mapping):
+        raise ValueError("run config must be a JSON object")
+    raw_pipes = config_payload.get("pipes")
+    if isinstance(raw_pipes, (str, bytes)) or not isinstance(raw_pipes, Sequence):
+        raise ValueError("run config 'pipes' must be an array")
+    measured_by_id = _measured_by_id(measured_payload)
+    merged_pipes = []
+    for item in raw_pipes:
+        if not isinstance(item, Mapping) or not item.get("pipe_id"):
+            raise ValueError("each run config pipe entry must contain pipe_id")
+        pipe_id = str(item["pipe_id"])
+        measured = measured_by_id.get(pipe_id)
+        if measured is None:
+            raise ValueError(f"measured points do not contain run config pipe_id: {pipe_id}")
+        merged = dict(item)
+        for name in ("start", "goal", "start_dir", "goal_dir"):
+            if name in measured:
+                merged[name] = measured[name]
+        merged_pipes.append(merged)
+
+    config_ids = {str(item["pipe_id"]) for item in raw_pipes if isinstance(item, Mapping) and item.get("pipe_id")}
+    unknown = sorted(set(measured_by_id).difference(config_ids))
+    if unknown:
+        raise ValueError(f"measured points do not match run config: unknown measured pipe_id={unknown}")
+    merged_payload = dict(config_payload)
+    merged_payload["pipes"] = merged_pipes
+    return merged_payload
+
+
+def load_run_config(path: str | Path, measured: Mapping[str, Any] | str | Path | None = None) -> RunConfig:
+    """Read, optionally merge measured coordinates, and validate a run config."""
+    payload = _read_json_payload(path, "run config")
+    if measured is not None:
+        measured_payload = (
+            _read_json_payload(measured, "measured points")
+            if isinstance(measured, (str, Path))
+            else measured
+        )
+        payload = _merge_measured_into_raw_config(payload, measured_payload)
     return RunConfig.from_dict(payload)
+
+
+def merge_measured_points(config: RunConfig, measured: Mapping[str, Any] | str | Path) -> RunConfig:
+    """Merge ``main_point.py --multi-output`` coordinates into a run config.
+
+    The measured file supplies only endpoint and direction coordinates. Pipe
+    specifications, priorities, and clearances remain owned by the run config.
+    """
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be a RunConfig")
+    payload = (
+        _read_json_payload(measured, "measured points")
+        if isinstance(measured, (str, Path))
+        else measured
+    )
+    measured_by_id = _measured_by_id(payload)
+
+    config_ids = {pipe.pipe_id for pipe in config.pipes}
+    unknown = sorted(set(measured_by_id).difference(config_ids))
+    missing = sorted(config_ids.difference(measured_by_id))
+    if unknown or missing:
+        details = []
+        if unknown:
+            details.append(f"unknown measured pipe_id={unknown}")
+        if missing:
+            details.append(f"missing measured pipe_id={missing}")
+        raise ValueError("measured points do not match run config: " + "; ".join(details))
+
+    required = ("start", "goal", "start_dir", "goal_dir")
+    merged = []
+    for pipe in config.pipes:
+        item = measured_by_id[pipe.pipe_id]
+        values = {name: item.get(name) for name in required}
+        missing_fields = [name for name, value in values.items() if value is None]
+        if missing_fields:
+            raise ValueError(f"measured points for {pipe.pipe_id} missing: {', '.join(missing_fields)}")
+        merged.append(replace(pipe, **values))
+    return RunConfig(pipes=tuple(merged), metadata=dict(config.metadata))
 
 
 read_run_config = load_run_config
@@ -228,6 +326,7 @@ __all__ = [
     "PipeInstance",
     "RunConfig",
     "load_run_config",
+    "merge_measured_points",
     "read_run_config",
     "from_json",
     "spec_outer_radius",
