@@ -7,7 +7,7 @@ JSON，并生成一个 Plotly HTML 预览。
 
 坐标约定：所有 CAD 长度默认使用毫米；X 截面固定 X、在 Y/Z 平面工作，
 Y 截面固定 Y、在 X/Z 平面工作。``hard`` 边界会被扣除，``soft`` 边界
-只作为代价/显示信息保留。
+只作为代价/显示信息保留；``none``（例如半透明观察对象）完全不参与约束。
 
 阅读代码时可以抓住三条主线：
 1. ``component_*`` 函数负责解释 settings 中的部件规则；
@@ -579,7 +579,11 @@ def serialize_space(
             "total_x_sections": len(axes.get("xs", [])),
             "total_y_sections": len(axes.get("ys", [])),
             "base_step_dir": str(settings.BASE_STEP_DIR),
+            # 旧字段继续保留；它现在表示本次测试路线的最大外部包络半径。
             "pipe_radius": float(settings.PIPE_RADIUS),
+            "route_max_envelope_radius": float(getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", settings.PIPE_RADIUS)),
+            "active_pipe_spec": str(getattr(settings, "ACTIVE_PIPE_SPEC", "")),
+            "pipe_spec_ids": sorted(getattr(settings, "selected_pipe_spec_ids", lambda: set())()),
             "default_obstacle_clearance": float(settings.DEFAULT_OBSTACLE_CLEARANCE),
             "default_ground_clearance": float(settings.DEFAULT_GROUND_CLEARANCE),
             "ground_z": float(ground_z),
@@ -1133,7 +1137,7 @@ def export_planning_space_html(space: dict, settings, output: Path) -> None:
   </div>
   <div id="plot"></div>
   <script>
-// Python 将 __DATA__ 替换为内嵌的规划空间 JSON。
+// 下方常量由 Python 写入内嵌的规划空间 JSON。
 const DATA = __DATA__;
 const traces = [];
 

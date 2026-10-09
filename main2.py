@@ -50,6 +50,8 @@ LOOKAHEAD_SECTIONS = int(getattr(settings, "BIDIR_LOOKAHEAD_SECTIONS", 4))
 SOFT_BAD_WEIGHT = float(getattr(settings, "SOFT_BAD_WEIGHT", 18000.0))
 ENGINEER_SOFT_BAD_WEIGHT = float(getattr(settings, "ENGINEER_SOFT_BAD_WEIGHT", 1800.0))
 HARD_BAD_WEIGHT = float(getattr(settings, "HARD_BAD_WEIGHT", 260000.0))
+BEND_ANGLE_RECOMMENDED_DEG = float(getattr(settings, "BEND_ANGLE_RECOMMENDED_DEG", 10.0))
+BEND_ANGLE_MINIMUM_DEG = float(getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0))
 
 SMALL_STEP = float(getattr(settings, "BIDIR_SMALL_STEP", 42.0))
 MEDIUM_STEP = float(getattr(settings, "BIDIR_MEDIUM_STEP", 78.0))
@@ -236,6 +238,8 @@ def soft_boundary_lines(section: dict) -> list[dict]:
 
 
 def point_hits_soft_boundary(section: dict, yz) -> tuple[bool, str | None]:
+    if not bool(getattr(settings, "SOFT_OBSTACLE_ENABLED", True)):
+        return False, None
     p = np.asarray(yz, dtype=float)
     best_name = None
     best_margin = 1e18
@@ -662,6 +666,10 @@ def score_candidate(profile, sections, state, candidate, kind, source, target, d
     elif kind == "connect_target":
         kind_bonus = -80.0
 
+    small_angle_cost = 0.0
+    if BEND_ANGLE_MINIMUM_DEG <= turn < BEND_ANGLE_RECOMMENDED_DEG:
+        small_angle_cost = float(getattr(settings, "SMALL_BEND_PENALTY", 120.0))
+
     score = (
         profile.length_w * step_len
         + profile.turn_w * turn
@@ -677,6 +685,7 @@ def score_candidate(profile, sections, state, candidate, kind, source, target, d
         + z_above_cost
         + z_low_cost
         + dir_cost
+        + small_angle_cost
         + bad_cost
         + kind_bonus
     )
@@ -698,6 +707,7 @@ def score_candidate(profile, sections, state, candidate, kind, source, target, d
         "z_above_cost": float(z_above_cost),
         "dir_cost": float(dir_cost),
         "turn": float(turn),
+        "small_angle_cost": float(small_angle_cost),
         "second": float(second),
         "point": candidate.tolist(),
         "increment_cost": float(score),
@@ -1718,6 +1728,10 @@ def build_joint_route(profile, space, model, start, goal, start_dir, goal_dir, v
             "allow_soft": bool(profile.allow_soft),
         },
         "method": "joint_xy_section_lattice_astar",
+        "active_pipe_spec": str(getattr(settings, "ACTIVE_PIPE_SPEC", "")),
+        "pipe_spec_ids": sorted(getattr(settings, "selected_pipe_spec_ids", lambda: set())()),
+        "route_max_envelope_radius": float(getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", settings.PIPE_RADIUS)),
+        "pipe_segments": list(getattr(settings, "PIPE_SEGMENTS", [])),
         "meeting_point": meeting_point,
         "connection_segment": [meeting_point, meeting_point],
         "front_branch_x": None,
