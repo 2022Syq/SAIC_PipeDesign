@@ -88,7 +88,7 @@ flowchart TD
 | `GOAL` | `[303.451906833262, 12.999672776061, 440.22547724222]` | 管道中心线终点。 |
 | `START_DIR_POINT` | `[51.982415501506, -18.194718322136, 554.539254174035]` | 减去 START 得到起点期望行进方向。 |
 | `GOAL_DIR_POINT` | `[313.451906833115, 12.999671724166, 440.225375445311]` | 减去 GOAL 得到终点期望行进方向。 |
-| `HANGER_POINTS` | `[]` | 吊点坐标列表；main_point.py 可搜索 GUADIAN、GUADIAN1～GUADIAN10 后写入。 |
+| `HANGER_POINTS` | `[]` | 单管旧入口的挂点坐标列表；main_point.py 可搜索 GUADIAN、GUADIAN1～GUADIAN10 后写入，仍用于距离报告。 |
 | `HANGER_POINT_DISTANCE_RANGE` | `100.0` | 每个吊点到路线中心线允许的最大距离。当前列表为空时没有吊点距离约束需要满足。 |
 
 文件前面还有一组被三引号包住的旧端点。这部分是字符串内容，不是当前生效的赋值。两个方向参考点用来规定朝向，不等同于路线必须经过的中间点。
@@ -97,8 +97,8 @@ flowchart TD
 
 | 参数 | 当前值 | 用途 |
 |---|---:|---|
-| `PIPE_DIAMETER` | 50.0 | 管道外径。 |
-| `PIPE_RADIUS` | `PIPE_DIAMETER / 2.0`，即 25.0 | 将管表面净空换成中心线避让距离，也供管体显示使用。 |
+| `PIPE_DIAMETER` | 由 `ACTIVE_PIPE_SPEC` 动态派生 | 单管默认规格的外径。多管入口不使用这个全局值，而从每根管的 `pipe_spec` 读取。 |
+| `PIPE_RADIUS` | 由 `PIPE_DIAMETER / 2.0` 动态派生 | 单管默认规格的外半径。多管规划空间使用所有管路中的最大外半径，工程化和 CATPart 输出再使用每根管自己的外半径。 |
 | `DEFAULT_OBSTACLE_CLEARANCE` | 20.0 | 一般障碍物所需的管表面净空。 |
 | `DEFAULT_GROUND_CLEARANCE` | 150.0 | 确定管道中心线最低离地高度时使用的净空。 |
 | `DEFAULT_COMPONENT_SOLID` | True | 默认把封闭的障碍截面内部也视为占用区。 |
@@ -110,7 +110,7 @@ flowchart TD
 | `ground` | `role="ground"`、`clearance=150.0`、`boundary="hard"` | 地面部件。当前空间主流程只把 role 为 obstacle 的部件送入障碍切片；ground 用来推断地面高度，即使这里标 hard 也不是按普通硬障碍参与截面差集。 |
 | `see_through` | `role="obstacle"`、`clearance=0.0`、`solid=False`、`boundary="soft"` | 软边界部件，保留截线，不从 main1 自由区域直接扣除；后续由路线策略决定能否通过。 |
 
-`role` 回答“这是什么部件”；`boundary` 回答“如何参与避让”；`solid` 回答“是否填充封闭轮廓内部”。这三个字段承担不同职责。普通障碍的中心线避让半径为 `PIPE_RADIUS + clearance`，按当前默认值为 25 + 20 = 45 mm。
+`role` 回答“这是什么部件”；`boundary` 回答“如何参与避让”；`solid` 回答“是否填充封闭轮廓内部”。这三个字段承担不同职责。普通障碍的中心线避让半径为当前规划外半径加 `clearance`；多管共享空间按最大管外半径计算。
 
 ### 空间范围、网格与截面精度
 
@@ -429,7 +429,8 @@ python upload.py --only 示例 --visible
 | `DEFAULT_NAMES` | 定义四个必需点的默认名称：`START`、`GOAL`、`START_DIR_POINT`、`GOAL_DIR_POINT`。 |
 | `START`、`GOAL` | 管路起点、终点坐标。 |
 | `START_DIR_POINT`、`GOAL_DIR_POINT` | 定义端点方向的辅助点坐标；它们仍是点，不是已经归一化的方向向量。方向计算由下游代码完成。 |
-| `HANGER_POINT_NAMES` | 可选挂点名称：`GUADIAN`、`GUADIAN1` … `GUADIAN10`，共 11 个候选名称。 |
+| `HANGER_POINT_NAMES` | 单管旧入口的可选挂点名称：`GUADIAN`、`GUADIAN1` … `GUADIAN10`。 |
+| `GUARDIAN_POINT_PATTERN` | 多管硬挂点名称模式：例如 `GUADIAN_01#1`、`GUADIAN_02#1`；`--multi-output` 会将它们写入测量点 JSON 的 `guardians`。 |
 | `DEFAULT_ALIASES` | 默认名称找不到时允许尝试的别名；只有该项仍使用默认请求名称时，才追加这些别名。 |
 
 | 配置项 | 允许尝试的默认别名 |
@@ -505,7 +506,7 @@ python upload.py --only 示例 --visible
 1. 默认操作活动 CATPart，脚本不会从磁盘打开辅助点模型；选中的文档没有 Part 时会报错。
 2. 默认寻找名为 `point` 的点集；找不到时尝试当前选中的容器，再不行就在全文档搜索辅助点。
 3. 如果点集已经找到，四个点就在该点集直接包含的 `HybridShapes` 中查找；点集存在但缺少某个点时，当前流程不会为这个缺失点再次自动全局搜索。
-4. 四个核心点必须都能测量。挂点可选；一个挂点也没找到时，默认保存行为会将 **`HANGER_POINTS` 写为 `[]`**，不会保留旧挂点。
+4. 四个核心点必须都能测量。单管旧挂点可选；一个挂点也没找到时，默认保存行为会将 **`HANGER_POINTS` 写为 `[]`**。多管 `--multi-output` 另外扫描 `GUADIAN_<编号>#<序号>`，写入 `guardians`，不会把它们混入单管全局列表。
 5. 挂点按预设名称顺序收集，重复坐标保留首次出现的名称。
 6. 测量坐标直接写入配置；本文件没有装配实例坐标变换、单位换算或额外坐标系变换。
 7. `settings.py` 如果有多个同名赋值，语法树扫描记录会保留最后遇到的赋值并替换它。当前源文件后面的端点赋值才是 Python 执行后生效的值。替换采用整段赋值语句所在行，不能理解为保证保留被替换行末的注释。
@@ -643,11 +644,11 @@ STEP/IGES 文件先读取成 OCC 的 `Shape`，即 CAD 几何对象，再离散�
 
 ### 当前实现的实际边界
 
-`main2` 和 `main3` 在生成路线后调用报告，把结果写入 `hanger_distance` 和 `hanger_valid`。当前挂点不是“路径必须经过”的求解硬约束，未调用的 `hanger_reference_cost` 也不能算成已经生效的优化功能。
+单管 `settings.HANGER_POINTS` 仍由 `main2` 和 `main3` 生成距离报告，未进入单管 A*。多管 JSON 的 `required_hangers` 是例外：`main2.plan_pipe_routes()` 会把每个硬挂点插入引导中心线，`main3.engineer_route()` 保留这些点并再次检查；任一点无法经过时，该候选失败。`hanger_reference_cost` 仍未作为搜索代价使用。
 
 没有挂点时，`all_within_range=True`：其含义只是没有待检查的点，不能证明真实支架布置已经合格。报告中的名称重新编号成 `GUADIAN1`、`GUADIAN2` 等，不保留原 CAD 中可能存在的 `GUADIAN` 或跳号名称。
 
-`main3` 使用圆弧采样点形成的折线检查距离，是对实际圆弧距离的近似。这个工具也不检查支架本体、安装方向、螺栓孔或支架碰撞。
+`required_hangers` 的零容差检查针对路线中心线坐标，不等同于支架实体、安装方向或螺栓孔检查；支架本体仍由 CAD 障碍模型负责。普通 `HANGER_POINTS` 报告仍使用允许距离，不减管半径。
 
 
 
@@ -703,7 +704,7 @@ main2 使用的起终点优先来自规划空间 JSON，而方向点来自当前
 | `smooth_joint_path()` | 保护两端锚点附近的连接链，对中间路线进行直连简化 |
 | `smooth_joint_path_unlocked()` | 在给定前瞻窗口内，寻找能安全直连的最远节点，删除中间冗余节点 |
 | `endpoint_anchor_tangency_info()` | 检查起终点是否保留方向锚点，记录直线长度、保护点数和方向误差 |
-| `build_joint_route()` | 组织搜索、验证、挂点报告，整理兼容旧查看器的数据字段 |
+| `build_joint_route()` | 组织搜索、验证、挂点报告；多管入口还插入并验证 `required_hangers` 硬挂点，整理兼容旧查看器的数据字段 |
 | `distance_to_lines()`、`sampled_path()`、`export_distance_png()` | 按路线里程采样，估算到各零件截线的管外壁距离，绘制 PNG |
 | `export_html()` | 将零件网格、路线和挂点组织为 Plotly 三维网页 |
 | `main()` | 依次计算五种策略、保存文件、输出运行信息 |
@@ -816,6 +817,9 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 | `hard_bad_samples`、`soft_bad_samples` | 相应违规采样计数，不是连续碰撞长度 |
 | `search` | 展开节点数、点数、搜索代价、方向锚点及端点切向检查 |
 | `hanger_distance`、`hanger_valid` | 生成后的挂点距离报告及是否全部在范围内 |
+| `hard_waypoints`、`hard_waypoint_names` | 多管配置传入的硬挂点坐标和名称；单管旧入口通常为空 |
+| `hard_waypoint_report`、`hard_waypoint_valid` | 每个硬挂点到中心线的距离报告；多管要求零容差全部通过 |
+| `profile_failures` | `plan_pipe_routes()` 中因硬挂点或规划约束失败的策略；其余策略仍会继续尝试 |
 | `front_path`、`rear_path`、`meeting_point` | 当前是为兼容旧显示而把整条路径从中间拆开，不是两端独立搜索的证据 |
 | `axis_switches` | 相邻段在“更偏 X”与“更偏 Y”之间切换次数，不等于真实三维弯头数 |
 | 根对象 `valid_segments` | 首选路线只要有任一硬/软违规就记 0，否则记全部线段数；它不是逐段实际合格数的累加 |
@@ -924,14 +928,16 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 | `endpoint_tangent_protected` | 是否识别并保留 main2 的两端保护链 |
 | `guide_length`、`engineered_length` | 输入折线长度与工程采样折线长度；后者是圆弧长度的采样近似 |
 | `s_bend_removed_points`、`wiggle_removed_points` | 预处理阶段删点计数，不应直接当作最终路径减少的制造弯数 |
-| `hanger_distance`、`hanger_valid` | 工程化后的挂点距离报告，仍不自动排除不合格路线 |
+| `hanger_distance`、`hanger_valid` | 工程化后的单管旧挂点距离报告，仍不自动排除不合格路线 |
+| `hard_waypoints`、`hard_waypoint_names` | 需要中心线经过的多管硬挂点及其名称 |
+| `hard_waypoint_report`、`hard_waypoint_valid` | 对工程化采样中心线的零容差复核；不通过时该候选失败 |
 | 顶层 `failed_routes` | 未能完成重构的方案名称与失败原因 |
 
 ### 当前源码中与使用有关的边界
 
 第一，main2 当前 `build_joint_route()` 把 `allow_soft` 放在 `strategy_weights` 内，main3 却从路线顶层 `source_route.get("allow_soft", False)` 读取。因此当前输出链中第五种软边界策略到 main3 可能按“不允许软边界”重构；不能认为名称里有 `engineer_soft` 就一定能沿软边界通过。
 
-第二，`build_line_arc_route()` 会跳过控制折线第一个和最后一个内部顶点的圆角化，以保留端点连接结构；这意味着端点方向符合要求，不代表所有连接处已经处处相切连续。
+第二，`build_line_arc_route()` 会跳过控制折线第一个和最后一个内部顶点的圆角化，以保留端点连接结构；多管硬挂点也会被保留为实际中心线点并跳过该点圆角化。因此硬点若恰好是转角，可能因 G1 切向不连续而被工程化验收拒绝；当前支持的安全语义是硬点落在可通过的直线段上。
 
 第三，工程化检查是在原规划空间上重新增加 2 mm 安全带；它并不是在 main2 的额外 20 mm 上继续加 2 mm。因此 main2 与 main3 的额外安全余量不能简单相加成全路径 22 mm。
 

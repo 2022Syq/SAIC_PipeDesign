@@ -23,7 +23,7 @@ import numpy as np
 
 import settings
 from common_space import html_aspect_ratio, html_x_range, load_json, load_step_meshes_for_html, save_json
-from hanger_utils import hanger_distance_report, settings_hanger_points
+from hanger_utils import hard_waypoint_report, hanger_distance_report, settings_hanger_points
 
 
 def import_shapely():
@@ -1682,19 +1682,71 @@ def joint_astar_path(
     }
 
 
-def build_joint_route(profile, space, model, start, goal, start_dir, goal_dir, validation_model=None):
+def _insert_hard_waypoints(
+    path: np.ndarray,
+    waypoints: list[np.ndarray],
+    model: DualSectionModel,
+    allow_soft: bool,
+) -> np.ndarray:
+    """Insert required points only where both new chords pass the model."""
+    result = remove_duplicate_points(np.asarray(path, dtype=float))
+    next_segment = 0
+    for waypoint in waypoints:
+        point = np.asarray(waypoint, dtype=float)
+        candidates = []
+        for index in range(next_segment, len(result) - 1):
+            first = result[index]
+            second = result[index + 1]
+            allowed_a, _ = joint_segment_allowed(model, first, point, allow_soft)
+            allowed_b, _ = joint_segment_allowed(model, point, second, allow_soft)
+            if not (allowed_a and allowed_b):
+                continue
+            segment = second - first
+            denominator = float(np.dot(segment, segment))
+            t = 0.0 if denominator <= 1e-12 else float(np.dot(point - first, segment) / denominator)
+            t = max(0.0, min(1.0, t))
+            nearest = first + t * segment
+            candidates.append((float(np.linalg.norm(point - nearest)), index))
+        if not candidates:
+            raise RuntimeError(
+                f"required guardian cannot be connected without collision: {point.tolist()}"
+            )
+        _, index = min(candidates)
+        result = np.vstack([result[: index + 1], point, result[index + 1:]])
+        next_segment = index + 1
+    return remove_duplicate_points(result)
+
+
+def build_joint_route(
+    profile,
+    space,
+    model,
+    start,
+    goal,
+    start_dir,
+    goal_dir,
+    validation_model=None,
+    hard_waypoints=None,
+    hard_waypoint_names=None,
+):
     print(f"\n--- Planning {profile.name} with joint X/Y sections ---")
     validation_model = validation_model or model
     path, search_info = joint_astar_path(
         profile, space, model, start, goal, start_dir, goal_dir,
         validation_model=validation_model,
     )
+    hard_points = [np.asarray(point, dtype=float) for point in (hard_waypoints or [])]
+    if hard_points:
+        path = _insert_hard_waypoints(path, hard_points, validation_model, profile.allow_soft)
     validation = joint_validate_path(validation_model, path)
     hanger_report = hanger_distance_report(
         path,
         settings_hanger_points(settings),
         float(getattr(settings, "HANGER_POINT_DISTANCE_RANGE", 100.0)),
     )
+    hard_report = hard_waypoint_report(path, hard_points, hard_waypoint_names, tolerance=0.0)
+    if not hard_report["all_within_tolerance"]:
+        raise RuntimeError("required guardian was not preserved in the guide route")
     half = max(1, len(path) // 2)
     front_path = path[: half + 1]
     rear_path = path[half:]
@@ -1748,6 +1800,10 @@ def build_joint_route(profile, space, model, start, goal, start_dir, goal_dir, v
         "point_count": int(len(path)),
         "hanger_distance": hanger_report,
         "hanger_valid": bool(hanger_report["all_within_range"]),
+        "hard_waypoints": [point.tolist() for point in hard_points],
+        "hard_waypoint_names": list(hard_waypoint_names or []),
+        "hard_waypoint_report": hard_report,
+        "hard_waypoint_valid": bool(hard_report["all_within_tolerance"]),
         "search": search_info,
         **validation,
     }
@@ -2050,13 +2106,34 @@ def plan_pipe_routes(space: dict, pipe=None) -> dict:
     pipe_id = value("pipe_id", None)
     pipe_spec = value("pipe_spec", getattr(settings, "ACTIVE_PIPE_SPEC", ""))
     pipe_radius = value("outer_radius", value("radius", getattr(settings, "PIPE_RADIUS", 25.0)))
+    required_hangers = value("required_hangers", ())
+    hard_waypoints = []
+    hard_waypoint_names = []
+    for guardian in required_hangers or ():
+        point = guardian.get("point") if isinstance(guardian, dict) else getattr(guardian, "point", None)
+        name = guardian.get("name") if isinstance(guardian, dict) else getattr(guardian, "name", None)
+        if point is None:
+            raise ValueError(f"required guardian {name or '(unnamed)'} has no point")
+        hard_waypoints.append(np.asarray(point, dtype=float))
+        hard_waypoint_names.append(str(name or f"GUADIAN_{len(hard_waypoint_names) + 1}"))
 
     routes = []
+    profile_failures = []
     for profile in make_profiles():
-        route = build_joint_route(
-            profile, space, model, start, goal, start_dir, goal_dir,
-            validation_model=validation_model,
-        )
+        try:
+            route = build_joint_route(
+                profile, space, model, start, goal, start_dir, goal_dir,
+                validation_model=validation_model,
+                hard_waypoints=hard_waypoints,
+                hard_waypoint_names=hard_waypoint_names,
+            )
+        except RuntimeError as exc:
+            profile_failures.append({
+                "name": profile.name,
+                "type": type(exc).__name__,
+                "reason": str(exc),
+            })
+            continue
         route["requested_extra_clearance"] = float(extra_clearance)
         route["pipe_id"] = pipe_id
         route["pipe_spec"] = pipe_spec
@@ -2065,12 +2142,25 @@ def plan_pipe_routes(space: dict, pipe=None) -> dict:
             route["name"] = f"{pipe_id}_{route['name']}"
         routes.append(route)
 
+    if not routes:
+        detail = "; ".join(
+            f"{item['name']}: {item['reason']}" for item in profile_failures
+        )
+        requirement = "required guardians" if hard_waypoints else "the planning constraints"
+        raise RuntimeError(
+            f"{pipe_id or 'pipe'}: no route profile satisfies {requirement}"
+            + (f" ({detail})" if detail else "")
+        )
+
     default_route = routes[0]
     return {
         "method": "joint_xy_section_lattice_astar",
         "pipe_id": pipe_id,
         "pipe_spec": pipe_spec,
         "pipe_radius": float(pipe_radius),
+        "hard_waypoints": [point.tolist() for point in hard_waypoints],
+        "hard_waypoint_names": hard_waypoint_names,
+        "profile_failures": profile_failures,
         "space_json": str(space.get("source_json", "")),
         "path": default_route["path"],
         "logs": default_route["logs"],

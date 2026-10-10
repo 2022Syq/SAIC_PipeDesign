@@ -21,6 +21,20 @@ import settings
 Vector3 = tuple[float, float, float]
 
 
+@dataclass(frozen=True)
+class GuardianPoint:
+    """One named hard route point measured in the common CATIA frame."""
+
+    name: str
+    point: Vector3
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("guardian name must be a non-empty string")
+        object.__setattr__(self, "name", self.name.strip())
+        object.__setattr__(self, "point", _vector(self.point, f"guardians[{self.name}].point"))
+
+
 def _vector(value: Any, field_name: str) -> Vector3:
     """Validate and normalize one three-dimensional point."""
     if isinstance(value, (str, bytes, Mapping)):
@@ -73,6 +87,42 @@ def _priority(value: Any) -> int:
     return result
 
 
+def _guardians(value: Any, field_name: str = "guardians") -> tuple[GuardianPoint, ...]:
+    """Normalize named hard route points from JSON."""
+    if value is None:
+        return ()
+    if isinstance(value, Mapping):
+        entries = [{"name": name, "point": point} for name, point in value.items()]
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        entries = list(value)
+    else:
+        raise ValueError(f"{field_name} must be an array or object")
+
+    result: list[GuardianPoint] = []
+    names: set[str] = set()
+    for index, entry in enumerate(entries):
+        if isinstance(entry, GuardianPoint):
+            if entry.name in names:
+                raise ValueError(f"duplicate guardian name: {entry.name}")
+            names.add(entry.name)
+            result.append(entry)
+            continue
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"{field_name}[{index}] must contain name and point")
+        name = entry.get("name")
+        point = entry.get("point")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{field_name}[{index}].name must be a non-empty string")
+        name = name.strip()
+        if name in names:
+            raise ValueError(f"duplicate guardian name: {name}")
+        names.add(name)
+        if point is None:
+            raise ValueError(f"{field_name}[{index}].point is required; merge measured CATIA points first")
+        result.append(GuardianPoint(name, _vector(point, f"{field_name}[{index}].point")))
+    return tuple(result)
+
+
 def spec_outer_radius(spec_id: str, specs: Mapping[str, Mapping[str, Any]] | None = None) -> float:
     """Return the outside radius (mm) for a row in ``settings.PIPE_SPECS``."""
     table = settings.PIPE_SPECS if specs is None else specs
@@ -106,6 +156,7 @@ class PipeInstance:
     pipe_spec: str
     required_clearance: float = 0.0
     priority: int = 0
+    required_hangers: tuple[GuardianPoint, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipe_id, str) or not self.pipe_id.strip():
@@ -125,6 +176,7 @@ class PipeInstance:
             _number(self.required_clearance, "required_clearance", minimum=0.0),
         )
         object.__setattr__(self, "priority", _priority(self.priority))
+        object.__setattr__(self, "required_hangers", _guardians(self.required_hangers, "required_hangers"))
         if self.start == self.start_dir:
             raise ValueError("start_dir must differ from start")
         if self.goal == self.goal_dir:
@@ -159,6 +211,7 @@ class PipeInstance:
             pipe_spec=value["pipe_spec"],
             required_clearance=value.get("required_clearance", 0.0),
             priority=value.get("priority", 0),
+            required_hangers=value.get("required_hangers", ()),
         )
 
 
@@ -237,6 +290,50 @@ def _measured_by_id(payload: Any) -> dict[str, Mapping[str, Any]]:
     return measured_by_id
 
 
+def _measured_guardians(payload: Any) -> dict[str, Vector3]:
+    raw = payload.get("guardians", []) if isinstance(payload, Mapping) else []
+    if raw is None:
+        return {}
+    if isinstance(raw, Mapping):
+        entries = [{"name": name, "point": point} for name, point in raw.items()]
+    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        entries = list(raw)
+    else:
+        raise ValueError("measured guardians must be an array or object")
+    result: dict[str, Vector3] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
+            raise ValueError(f"measured guardians[{index}] must contain name and point")
+        name = entry["name"].strip()
+        if name in result:
+            raise ValueError(f"duplicate measured guardian name: {name}")
+        result[name] = _vector(entry.get("point"), f"measured guardians[{index}].point")
+    return result
+
+
+def _resolve_required_hangers(raw: Any, measured: Mapping[str, Vector3]) -> list[dict[str, Any]]:
+    if raw is None:
+        return []
+    if isinstance(raw, Mapping):
+        entries = [{"name": name, "point": point} for name, point in raw.items()]
+    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        entries = list(raw)
+    else:
+        raise ValueError("required_hangers must be an array or object")
+    resolved = []
+    for index, entry in enumerate(entries):
+        if isinstance(entry, str):
+            entry = {"name": entry}
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
+            raise ValueError(f"required_hangers[{index}] must contain a name")
+        name = entry["name"].strip()
+        point = entry.get("point", measured.get(name))
+        if point is None:
+            raise ValueError(f"no measured point found for required guardian: {name}")
+        resolved.append({"name": name, "point": _vector(point, f"required_hangers[{index}].point")})
+    return resolved
+
+
 def _merge_measured_into_raw_config(config_payload: Any, measured_payload: Any) -> Mapping[str, Any]:
     if not isinstance(config_payload, Mapping):
         raise ValueError("run config must be a JSON object")
@@ -244,6 +341,7 @@ def _merge_measured_into_raw_config(config_payload: Any, measured_payload: Any) 
     if isinstance(raw_pipes, (str, bytes)) or not isinstance(raw_pipes, Sequence):
         raise ValueError("run config 'pipes' must be an array")
     measured_by_id = _measured_by_id(measured_payload)
+    measured_guardians = _measured_guardians(measured_payload)
     merged_pipes = []
     for item in raw_pipes:
         if not isinstance(item, Mapping) or not item.get("pipe_id"):
@@ -256,6 +354,10 @@ def _merge_measured_into_raw_config(config_payload: Any, measured_payload: Any) 
         for name in ("start", "goal", "start_dir", "goal_dir"):
             if name in measured:
                 merged[name] = measured[name]
+        if "required_hangers" in merged:
+            merged["required_hangers"] = _resolve_required_hangers(
+                merged["required_hangers"], measured_guardians
+            )
         merged_pipes.append(merged)
 
     config_ids = {str(item["pipe_id"]) for item in raw_pipes if isinstance(item, Mapping) and item.get("pipe_id")}
@@ -294,6 +396,7 @@ def merge_measured_points(config: RunConfig, measured: Mapping[str, Any] | str |
         else measured
     )
     measured_by_id = _measured_by_id(payload)
+    measured_guardians = _measured_guardians(payload)
 
     config_ids = {pipe.pipe_id for pipe in config.pipes}
     unknown = sorted(set(measured_by_id).difference(config_ids))
@@ -314,7 +417,13 @@ def merge_measured_points(config: RunConfig, measured: Mapping[str, Any] | str |
         missing_fields = [name for name, value in values.items() if value is None]
         if missing_fields:
             raise ValueError(f"measured points for {pipe.pipe_id} missing: {', '.join(missing_fields)}")
-        merged.append(replace(pipe, **values))
+        guardians = pipe.required_hangers
+        if guardians:
+            resolved = _resolve_required_hangers(
+                [{"name": guardian.name, "point": guardian.point} for guardian in guardians], measured_guardians
+            )
+            guardians = tuple(GuardianPoint(entry["name"], entry["point"]) for entry in resolved)
+        merged.append(replace(pipe, required_hangers=guardians, **values))
     return RunConfig(pipes=tuple(merged), metadata=dict(config.metadata))
 
 
@@ -323,6 +432,7 @@ from_json = load_run_config
 
 
 __all__ = [
+    "GuardianPoint",
     "PipeInstance",
     "RunConfig",
     "load_run_config",

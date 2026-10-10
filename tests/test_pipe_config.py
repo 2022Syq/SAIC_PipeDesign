@@ -35,6 +35,47 @@ def test_pipe_radius_is_derived_from_settings_spec():
     assert spec_outer_radius(pipe.pipe_spec) == expected
 
 
+def test_required_guardians_are_named_and_keep_coordinates():
+    pipe = PipeInstance.from_dict(
+        pipe_data(
+            pipe_id="PIPE_01",
+            pipe_spec="metal_9",
+            required_clearance=0,
+            required_hangers=[{"name": "GUADIAN_01#1", "point": [25, 1, 2]}],
+        )
+    )
+    assert pipe.required_hangers[0].name == "GUADIAN_01#1"
+    assert pipe.required_hangers[0].point == (25.0, 1.0, 2.0)
+
+
+def test_required_guardians_can_be_resolved_from_measured_points(tmp_path):
+    config_path = tmp_path / "specs.json"
+    config_path.write_text(
+        json.dumps({"pipes": [{**pipe_data("PIPE_01", priority=1), "required_hangers": ["GUADIAN_01#1"]}]}),
+        encoding="utf-8",
+    )
+    points_path = tmp_path / "points.json"
+    points_path.write_text(
+        json.dumps(
+            {
+                "pipes": [
+                    {
+                        "pipe_id": "PIPE_01",
+                        "start": [0, 0, 0],
+                        "goal": [100, 0, 0],
+                        "start_dir": [20, 0, 0],
+                        "goal_dir": [120, 0, 0],
+                    }
+                ],
+                "guardians": [{"name": "GUADIAN_01#1", "point": [50, 0, 0]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_run_config(config_path, measured=points_path)
+    assert config.pipes[0].required_hangers[0].point == (50.0, 0.0, 0.0)
+
+
 def test_run_config_validates_ids_and_preserves_priority_order():
     config = RunConfig.from_dict({"pipes": [pipe_data("late", 2), pipe_data("early", 1)]})
     assert [pipe.pipe_id for pipe in config.pipes] == ["late", "early"]

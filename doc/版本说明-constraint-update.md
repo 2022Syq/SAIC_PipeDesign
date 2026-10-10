@@ -17,7 +17,7 @@
 
 ### 规格与工艺参数
 
-`settings.py` 新增 4 种金属管和 3 种胶管规格，记录外径、内径、壁厚、刚性/柔性、弯曲半径和直线段要求。
+`settings.py` 新增 4 种金属管和 3 种胶管规格，记录外径、内径、壁厚、刚性/柔性、弯曲半径和直线段要求。规格 ID 为 `metal_9`、`metal_12`、`metal_16`、`metal_19_05`、`hose_8DE3`、`hose_11DE3`、`hose_15DE3`，对应 SAAA 工艺表中的管径和材料；当前主动连续芯管为 `metal_19_05`。
 
 - 金属管弯曲半径按 `max(Excel 明确值, 1.5D)` 形成硬下限。
 - 胶管使用 R50、R60、R75 的规格硬下限。
@@ -27,6 +27,11 @@
 - 阀座两侧分别检查直线段，推荐 25 mm、极限 5 mm。
 - 铝套背部按已知轴长配置；铝套中心轴周围使用 R80 推荐、R65 极限避让区域。
 - 连接件型号只记录，不参与本轮路径验证。
+
+单管 `HANGER_POINTS`/`GUADIAN` 仍用于路线生成后的距离报告。多管配置新增
+`required_hangers`：用 `GUADIAN_01#1`、`GUADIAN_02#1` 这类可测量 Point 的名称
+指定硬挂点，并按每条管路的 `START → GOAL` 顺序插入 main2 导引路线。支架实体
+本身不会被自动识别为点；`required_clearance=0.0` 表示不增加管间包络的额外间隙。
 
 ### 规划空间与障碍物
 
@@ -54,7 +59,7 @@
 
 `PIPE_SEGMENTS`、`WELD_POINTS`、`VALVE_SEATS` 和 `ALUMINUM_SLEEVES` 已建立配置入口，当前为空，等待工程师提供管段和工艺件位置数据。
 
-因此当前 `main4.py` 生成连续金属芯管；胶管局部包覆和铝套实体需要管段位置数据后再建模。CATProduct 仍需先通过 CATIA 导出 IGES，规划程序不直接读取 CATProduct 内部规格和分支拓扑。
+因此当前 `main4.py` 生成连续金属芯管；胶管局部包覆和铝套实体需要管段位置数据后再建模。多管入口通过 `main_point.py --multi-output` 读取端点、方向点和 `guardians`，再由 `multi_pipeline.py --points ...` 合并规格配置；CATProduct 仍需先通过 CATIA 导出 IGES，规划程序不直接读取 CATProduct 内部规格和分支拓扑。
 
 ## 已完成验证
 

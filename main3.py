@@ -18,7 +18,7 @@ import numpy as np
 
 import settings
 from common_space import html_aspect_ratio, html_x_range, load_json, load_step_meshes_for_html, save_json
-from hanger_utils import hanger_distance_report, settings_hanger_points
+from hanger_utils import hard_waypoint_report, hanger_distance_report, settings_hanger_points
 from main2 import DualSectionModel, joint_segment_allowed, joint_validate_path, section_polygons
 
 
@@ -116,7 +116,7 @@ def turn_angle_degrees(prev_pt: np.ndarray, vertex: np.ndarray, next_pt: np.ndar
     return float(math.degrees(math.acos(dot)))
 
 
-def merge_small_turns(path: np.ndarray, minimum_turn_deg: float) -> np.ndarray:
+def merge_small_turns(path: np.ndarray, minimum_turn_deg: float, preserve_points=None) -> np.ndarray:
     """Remove small interior turns without changing the endpoint directions."""
     points = remove_close_points(np.asarray(path, dtype=float), 1e-6)
     if len(points) <= 2:
@@ -128,6 +128,9 @@ def merge_small_turns(path: np.ndarray, minimum_turn_deg: float) -> np.ndarray:
         for index in range(1, len(points) - 1):
             # 两端相邻控制点定义用户指定的切向，不能按小角度抖动删除。
             if index == 1 or index == len(points) - 2:
+                keep.append(points[index])
+                continue
+            if any(dist(points[index], point) <= 1e-6 for point in (preserve_points or [])):
                 keep.append(points[index])
                 continue
             angle = turn_angle_degrees(points[index - 1], points[index], points[index + 1])
@@ -423,6 +426,29 @@ def remove_close_points(path: np.ndarray, min_len: float) -> np.ndarray:
     if dist(out[-1], path[-1]) > 1e-6:
         out.append(np.asarray(path[-1], dtype=float))
     return np.asarray(out, dtype=float)
+
+
+def preserve_hard_waypoints(control: np.ndarray, guide: np.ndarray, waypoints) -> np.ndarray:
+    """Insert exact guide points into a simplified control path in order."""
+    result = [np.asarray(point, dtype=float) for point in remove_close_points(control, 1e-6)]
+    guide = np.asarray(guide, dtype=float)
+    for waypoint in waypoints or []:
+        point = np.asarray(waypoint, dtype=float)
+        guide_index = int(np.argmin(np.linalg.norm(guide - point, axis=1)))
+        if float(np.linalg.norm(guide[guide_index] - point)) > 1e-5:
+            raise RuntimeError(f"required guardian is not present in guide path: {point.tolist()}")
+        if any(dist(existing, point) <= 1e-6 for existing in result):
+            continue
+        control_indices = [
+            int(np.argmin(np.linalg.norm(guide - existing, axis=1)))
+            for existing in result
+        ]
+        insert_at = next(
+            (index for index, candidate_index in enumerate(control_indices) if candidate_index > guide_index),
+            len(result) - 1,
+        )
+        result.insert(max(1, insert_at), point)
+    return remove_close_points(np.asarray(result, dtype=float), 1e-6)
 
 
 def point_line_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
@@ -776,6 +802,7 @@ def build_line_arc_route(
     max_arc_deg: float,
     sample_deg: float,
     min_corner_angle_deg: float,
+    protected_points=None,
 ):
     segments = []
     sampled = [guide[0]]
@@ -791,7 +818,8 @@ def build_line_arc_route(
     for i in range(1, len(guide) - 1):
         included_angle = corner_included_angle_deg(guide[i - 1], guide[i], guide[i + 1])
         min_corner_angle = min(min_corner_angle, included_angle)
-        if included_angle + 1e-6 < required_corner_angle:
+        protected = any(dist(guide[i], point) <= 1e-6 for point in (protected_points or []))
+        if not protected and included_angle + 1e-6 < required_corner_angle:
             corner_angle_violations.append({
                 "index": int(i),
                 "angle_deg": float(included_angle),
@@ -801,7 +829,9 @@ def build_line_arc_route(
 
         # 首末锚点也必须圆角，否则 30 mm 方向直线与后续导引线之间会留下尖角。
         # 圆角沿已有端部直线切入，不移动端点，也不改变其切向。
-        fillet = fillet_corner(guide[i - 1], guide[i], guide[i + 1], radius, max_arc_deg, sample_deg)
+        fillet = None if protected else fillet_corner(
+            guide[i - 1], guide[i], guide[i + 1], radius, max_arc_deg, sample_deg
+        )
         if fillet is None:
             if dist(current, guide[i]) > 1e-6:
                 segments.append({"type": "line", "start": current.tolist(), "end": guide[i].tolist()})
@@ -993,6 +1023,11 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     route_name = source_route.get("name", "route")
     guide = np.asarray(source_route["path"], dtype=float)
     guide = remove_close_points(guide, 1e-6)
+    hard_points = [
+        np.asarray(point, dtype=float)
+        for point in params.get("hard_waypoints", source_route.get("hard_waypoints", []))
+    ]
+    hard_names = list(params.get("hard_waypoint_names", source_route.get("hard_waypoint_names", [])))
     constraint_profile = params.get("constraint_profile") or active_constraint_profile()
     route_start = np.asarray(params.get("start", settings.START), dtype=float)
     route_goal = np.asarray(params.get("goal", settings.GOAL), dtype=float)
@@ -1097,10 +1132,14 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
             control = simplify_to_max_points(control, max_turn_count + 2)
         control_before_s_bend = control.copy()
 
-    # 合并内部小角度抖动，保留决定起终点方向的首末控制点。
+    if hard_points:
+        control = preserve_hard_waypoints(control, guide, hard_points)
+
+    # 合并内部小角度抖动，保留决定起终点方向的首末控制点和硬挂点。
     control = merge_small_turns(
         control,
         float(getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0)),
+        preserve_points=hard_points,
     )
     control_before_s_bend = control.copy()
 
@@ -1118,7 +1157,10 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     fallback_control = merge_small_turns(
         remove_close_points(guide, 1e-6),
         float(getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0)),
+        preserve_points=hard_points,
     )
+    if hard_points:
+        fallback_control = preserve_hard_waypoints(fallback_control, guide, hard_points)
     if len(fallback_control) <= max_turn_count + 2 and not np.array_equal(control_options[0], fallback_control):
         control_options.append(fallback_control)
     control_options = [
@@ -1137,6 +1179,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                 params["max_bend_angle_deg"],
                 params["arc_sample_angle_deg"],
                 params["min_corner_angle_deg"],
+                protected_points=hard_points,
             )
             collision_report = (
                 joint_validate_path(collision_model, candidate["sampled_path"])
@@ -1183,6 +1226,9 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         params.get("hanger_points", []),
         params.get("hanger_distance_range", 100.0),
     )
+    hard_report = hard_waypoint_report(sampled, hard_points, hard_names, tolerance=0.0)
+    if not hard_report["all_within_tolerance"]:
+        raise RuntimeError(f"{route_name}: engineered route does not pass every required guardian")
 
     return {
         "name": route_name,
@@ -1235,6 +1281,10 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "collision_report": collision_report,
         "hanger_distance": hanger_report,
         "hanger_valid": bool(hanger_report["all_within_range"]),
+        "hard_waypoints": [point.tolist() for point in hard_points],
+        "hard_waypoint_names": hard_names,
+        "hard_waypoint_report": hard_report,
+        "hard_waypoint_valid": bool(hard_report["all_within_tolerance"]),
     }
 
 
@@ -1263,6 +1313,16 @@ def make_engineering_params(pipe=None, collision_model=None) -> dict:
     )
     if radius is None:
         radius = profile["envelope_radius"]
+    required_hangers = value("required_hangers", ())
+    hard_waypoints = []
+    hard_waypoint_names = []
+    for guardian in required_hangers or ():
+        point = guardian.get("point") if isinstance(guardian, dict) else getattr(guardian, "point", None)
+        name = guardian.get("name") if isinstance(guardian, dict) else getattr(guardian, "name", None)
+        if point is None:
+            raise ValueError(f"required guardian {name or '(unnamed)'} has no point")
+        hard_waypoints.append(list(point))
+        hard_waypoint_names.append(str(name or f"GUADIAN_{len(hard_waypoint_names) + 1}"))
     return {
         "constraint_profile": profile,
         "bend_radius": profile["preferred_bend_radius"],
@@ -1289,6 +1349,8 @@ def make_engineering_params(pipe=None, collision_model=None) -> dict:
         "hanger_distance_range": float(value(
             "hanger_distance_range", getattr(settings, "HANGER_POINT_DISTANCE_RANGE", 100.0)
         )),
+        "hard_waypoints": hard_waypoints,
+        "hard_waypoint_names": hard_waypoint_names,
         "pipe_id": value("pipe_id", None),
         "start": value("start", settings.START),
         "goal": value("goal", settings.GOAL),

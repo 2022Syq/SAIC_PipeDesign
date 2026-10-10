@@ -108,3 +108,27 @@ def hanger_reference_cost(point, hanger_points, distance_range: float, weight: f
         if distance > limit:
             cost += ((distance - limit) / limit) ** 2
     return float(weight) * cost
+
+
+def hard_waypoint_report(path, points, names=None, tolerance: float = 1e-6) -> dict:
+    """Report exact or tolerance-bounded passage through required points."""
+    values = as_point_array(points)
+    labels = list(names or [])
+    records = []
+    for index, point in enumerate(values):
+        name = labels[index] if index < len(labels) else f"GUADIAN_{index + 1}"
+        distance = point_path_distance(point, np.asarray(path, dtype=float))
+        records.append({
+            "index": int(index + 1),
+            "name": str(name),
+            "point": point.tolist(),
+            "distance": float(distance),
+            "within_tolerance": bool(distance <= float(tolerance) + 1e-9),
+        })
+    return {
+        "count": len(records),
+        "tolerance": float(tolerance),
+        "satisfied_count": sum(int(item["within_tolerance"]) for item in records),
+        "all_within_tolerance": all(item["within_tolerance"] for item in records),
+        "points": records,
+    }

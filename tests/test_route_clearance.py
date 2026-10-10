@@ -49,3 +49,20 @@ def test_pipe_clearance_uses_each_spec_radius_and_required_clearance():
     assert report["radius_b"] == pytest.approx(6)
     assert report["required_clearance"] == 4
     assert report["valid"] is True
+
+
+def test_pipe_clearance_zero_extra_gap_still_blocks_swept_intersection():
+    first = PipeInstance.from_dict({
+        "pipe_id": "a", "start": [0, 0, 0], "goal": [100, 0, 0],
+        "start_dir": [1, 0, 0], "goal_dir": [101, 0, 0],
+        "pipe_spec": "metal_9", "required_clearance": 0,
+    })
+    second = PipeInstance.from_dict({
+        "pipe_id": "b", "start": [0, 0, 0], "goal": [100, 0, 0],
+        "start_dir": [1, 0, 0], "goal_dir": [101, 0, 0],
+        "pipe_spec": "metal_12", "required_clearance": 0,
+    })
+    report = check_pipe_clearance(first, [first.start, first.goal], second, [second.start, second.goal])
+    assert report["required_clearance"] == 0
+    assert report["minimum_clearance"] == pytest.approx(-10.5)
+    assert report["valid"] is False
