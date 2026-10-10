@@ -796,6 +796,113 @@ def fillet_corner(prev_pt, vertex, next_pt, radius: float, max_arc_deg: float, s
     }
 
 
+def _insert_hard_waypoint_bridges(
+    guide: np.ndarray,
+    protected_points,
+    minimum_side_length: float,
+) -> np.ndarray:
+    """Insert a straight bridge through each exact hard waypoint.
+
+    The bridge is deliberately longer than the required straight length.  The
+    two new outer points may be rounded into the surrounding route, leaving a
+    straight, tangent-continuous segment through the protected point while the
+    rest of the route keeps the normal line/arc treatment.
+    """
+    points = np.asarray(guide, dtype=float)
+    protected = [np.asarray(point, dtype=float) for point in (protected_points or [])]
+    if not protected:
+        return points
+    minimum_side_length = float(minimum_side_length)
+    if minimum_side_length <= 0.0:
+        raise ValueError("hard waypoint minimum straight length must be positive")
+    bridge_half_length = 2.0 * minimum_side_length
+
+    for waypoint in protected:
+        distances = np.linalg.norm(points - waypoint, axis=1)
+        index = int(np.argmin(distances))
+        if float(distances[index]) > 1e-5:
+            raise RuntimeError(
+                "required guardian is not present in the engineering guide: "
+                f"{waypoint.tolist()}"
+            )
+        if index <= 0 or index >= len(points) - 1:
+            raise RuntimeError(
+                "required guardian must be an interior engineering control point: "
+                f"{waypoint.tolist()}"
+            )
+
+        incoming = norm(points[index] - points[index - 1])
+        outgoing = norm(points[index + 1] - points[index])
+        direction = norm(incoming + outgoing)
+        if float(np.linalg.norm(incoming + outgoing)) < 1e-9:
+            direction = incoming
+
+        left = waypoint - direction * bridge_half_length
+        right = waypoint + direction * bridge_half_length
+        points = np.vstack([points[:index], left, waypoint, right, points[index + 1:]])
+
+    return points
+
+
+def validate_hard_waypoint_geometry(
+    segments: list[dict],
+    protected_points,
+    minimum_side_length: float,
+) -> dict:
+    """Check the local straight, tangent-continuous bridge at each hard point."""
+    minimum_side_length = float(minimum_side_length)
+    reports = []
+    for point in (protected_points or []):
+        point = np.asarray(point, dtype=float)
+        left_indices = [
+            index for index, segment in enumerate(segments)
+            if dist(segment["end"], point) <= 1e-5
+        ]
+        right_indices = [
+            index for index, segment in enumerate(segments)
+            if dist(segment["start"], point) <= 1e-5
+        ]
+        left = segments[max(left_indices)] if left_indices else None
+        right = segments[min(right_indices)] if right_indices else None
+        left_length = dist(left["start"], left["end"]) if left else 0.0
+        right_length = dist(right["start"], right["end"]) if right else 0.0
+        left_direction = norm(
+            np.asarray(left["end"], dtype=float) - np.asarray(left["start"], dtype=float)
+        ) if left else np.zeros(3)
+        right_direction = norm(
+            np.asarray(right["end"], dtype=float) - np.asarray(right["start"], dtype=float)
+        ) if right else np.zeros(3)
+        direction_error = 180.0
+        if left is not None and right is not None:
+            direction_error = float(math.degrees(math.acos(max(
+                -1.0, min(1.0, float(np.dot(left_direction, right_direction)))
+            ))))
+        valid = bool(
+            left is not None
+            and right is not None
+            and left.get("type") == "line"
+            and right.get("type") == "line"
+            and left_length + 1e-6 >= minimum_side_length
+            and right_length + 1e-6 >= minimum_side_length
+            and direction_error <= 1e-4
+        )
+        reports.append({
+            "point": point.tolist(),
+            "left_segment_length_mm": float(left_length),
+            "right_segment_length_mm": float(right_length),
+            "direction_error_deg": float(direction_error),
+            "left_segment_type": left.get("type") if left else None,
+            "right_segment_type": right.get("type") if right else None,
+            "minimum_side_length_mm": minimum_side_length,
+            "valid": valid,
+        })
+    return {
+        "valid": all(item["valid"] for item in reports),
+        "minimum_side_length_mm": minimum_side_length,
+        "points": reports,
+    }
+
+
 def build_line_arc_route(
     guide: np.ndarray,
     radius: float,
@@ -803,7 +910,11 @@ def build_line_arc_route(
     sample_deg: float,
     min_corner_angle_deg: float,
     protected_points=None,
+    protected_straight_min_mm: float = 15.0,
 ):
+    guide = _insert_hard_waypoint_bridges(
+        guide, protected_points, protected_straight_min_mm
+    )
     segments = []
     sampled = [guide[0]]
     current = guide[0]
@@ -859,6 +970,9 @@ def build_line_arc_route(
         sampled.append(guide[-1])
 
     sampled = np.asarray(sampled, dtype=float)
+    protected_report = validate_hard_waypoint_geometry(
+        segments, protected_points, protected_straight_min_mm
+    )
     return {
         "segments": segments,
         "sampled_path": sampled,
@@ -870,6 +984,7 @@ def build_line_arc_route(
         "required_min_corner_angle_deg": float(required_corner_angle),
         "corner_angle_valid": len(corner_angle_violations) == 0,
         "corner_angle_violations": corner_angle_violations,
+        "protected_waypoint_geometry": protected_report,
     }
 
 
@@ -1180,6 +1295,9 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                 params["arc_sample_angle_deg"],
                 params["min_corner_angle_deg"],
                 protected_points=hard_points,
+                protected_straight_min_mm=float(
+                    params.get("hard_waypoint_min_straight_mm", 15.0)
+                ),
             )
             collision_report = (
                 joint_validate_path(collision_model, candidate["sampled_path"])
@@ -1198,7 +1316,8 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                 candidate["sampled_path"], candidate, constraint_profile, collision_model=collision_model,
             )
             if (candidate["corner_angle_valid"] and clearance_ok
-                    and constraint_report["valid"] and geometry_report["valid"]):
+                    and constraint_report["valid"] and geometry_report["valid"]
+                    and candidate["protected_waypoint_geometry"]["valid"]):
                 engineered = candidate
                 used_radius = radius
                 used_control = control_candidate
@@ -1276,6 +1395,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "required_min_corner_angle_deg": engineered["required_min_corner_angle_deg"],
         "corner_angle_valid": bool(engineered["corner_angle_valid"]),
         "corner_angle_violations": engineered["corner_angle_violations"],
+        "protected_waypoint_geometry": engineered["protected_waypoint_geometry"],
         "constraint_report": constraint_report,
         "geometry_report": geometry_report,
         "collision_report": collision_report,
@@ -1351,6 +1471,9 @@ def make_engineering_params(pipe=None, collision_model=None) -> dict:
         )),
         "hard_waypoints": hard_waypoints,
         "hard_waypoint_names": hard_waypoint_names,
+        "hard_waypoint_min_straight_mm": float(
+            getattr(settings, "ENGINEERING_HARD_WAYPOINT_MIN_STRAIGHT_MM", 15.0)
+        ),
         "pipe_id": value("pipe_id", None),
         "start": value("start", settings.START),
         "goal": value("goal", settings.GOAL),

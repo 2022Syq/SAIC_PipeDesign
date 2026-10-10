@@ -51,6 +51,39 @@ class EngineeringGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(report["max_joint_tangent_error_deg"], 15.9453959009)
         self.assertTrue(all(item["rule"] == "joint_tangent" for item in report["violations"]))
 
+    def test_hard_waypoint_gets_local_straight_bridge(self):
+        waypoint = self.guide[2]
+        route = main3.build_line_arc_route(
+            self.guide,
+            28.575,
+            90,
+            4,
+            90,
+            protected_points=[waypoint],
+            protected_straight_min_mm=15,
+        )
+        geometry = self.geometry(route["segments"])
+        protected = route["protected_waypoint_geometry"]
+        self.assertTrue(geometry["valid"], geometry)
+        self.assertTrue(protected["valid"], protected)
+        item = protected["points"][0]
+        self.assertEqual(item["left_segment_type"], "line")
+        self.assertEqual(item["right_segment_type"], "line")
+        self.assertGreaterEqual(item["left_segment_length_mm"], 15)
+        self.assertGreaterEqual(item["right_segment_length_mm"], 15)
+        self.assertLessEqual(item["direction_error_deg"], 1e-4)
+
+    def test_hard_waypoint_must_remain_an_interior_point(self):
+        with self.assertRaisesRegex(RuntimeError, "interior engineering control point"):
+            main3.build_line_arc_route(
+                self.guide,
+                28.575,
+                90,
+                4,
+                90,
+                protected_points=[self.guide[0]],
+            )
+
     def test_joint_gap_and_changed_endpoint_are_rejected(self):
         segments = copy.deepcopy(self.build()["segments"])
         segments[1]["start"][2] += 0.1
