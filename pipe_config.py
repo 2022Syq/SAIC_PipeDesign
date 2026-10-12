@@ -159,6 +159,7 @@ class PipeInstance:
     required_hangers: tuple[GuardianPoint, ...] = ()
     allow_hard_conflicts: bool = False
     allow_inter_pipe_conflicts: bool = False
+    allow_direct_guide_modeling: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipe_id, str) or not self.pipe_id.strip():
@@ -183,6 +184,8 @@ class PipeInstance:
             raise ValueError("allow_hard_conflicts must be a boolean")
         if not isinstance(self.allow_inter_pipe_conflicts, bool):
             raise ValueError("allow_inter_pipe_conflicts must be a boolean")
+        if not isinstance(self.allow_direct_guide_modeling, bool):
+            raise ValueError("allow_direct_guide_modeling must be a boolean")
         if self.start == self.start_dir:
             raise ValueError("start_dir must differ from start")
         if self.goal == self.goal_dir:
@@ -220,6 +223,7 @@ class PipeInstance:
             required_hangers=value.get("required_hangers", ()),
             allow_hard_conflicts=value.get("allow_hard_conflicts", False),
             allow_inter_pipe_conflicts=value.get("allow_inter_pipe_conflicts", False),
+            allow_direct_guide_modeling=value.get("allow_direct_guide_modeling", False),
         )
 
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import re
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass
@@ -354,6 +355,57 @@ def _invalid_clearance_reports(reports: list[dict[str, Any]]) -> list[dict[str, 
     return [report for report in reports if not bool(report.get("valid", False))]
 
 
+def _direct_guide_engineering(candidate: dict[str, Any], pipe: Any, reason: str) -> dict[str, Any]:
+    """Represent an explicitly authorized guide route as straight CATIA segments."""
+    from main3 import path_length, tube_mesh
+    import numpy as np
+    import settings
+
+    path = [list(point) for point in candidate.get("path", [])]
+    if len(path) < 2:
+        raise RuntimeError("direct guide modeling requires at least two guide points")
+    segments = [
+        {
+            "type": "line",
+            "start": path[index],
+            "end": path[index + 1],
+            "length": float(math.dist(path[index], path[index + 1])),
+        }
+        for index in range(len(path) - 1)
+    ]
+    array_path = np.asarray(path, dtype=float)
+    result = dict(candidate)
+    result.update({
+        "color": candidate.get("color", "#2563eb"),
+        "engineering_fallback": "direct_guide_modeling",
+        "engineering_fallback_reason": str(reason),
+        "engineered_path": path,
+        "guide_path": path,
+        "z_smoothed_guide_path": path,
+        "control_path_before_s_bend": path,
+        "control_path": path,
+        "segments": segments,
+        "tube_mesh": tube_mesh(array_path, float(getattr(pipe, "outer_radius", 0.0)), int(getattr(settings, "ENGINEERING_TUBE_SEGMENTS", 16))),
+        "guide_length": float(path_length(array_path)),
+        "engineered_length": float(path_length(array_path)),
+        "arc_count": 0,
+        "turn_count": max(0, len(path) - 2),
+        "main_turn_count": max(0, len(path) - 2),
+        "radius_reduced_count": 0,
+        "geometry_report": {
+            "valid": False,
+            "mode": "direct_guide_modeling",
+            "reason": str(reason),
+        },
+        "constraint_report": {
+            "valid": False,
+            "mode": "direct_guide_modeling",
+            "reason": str(reason),
+        },
+    })
+    return result
+
+
 def run_multi_pipe(
     config_or_path: "RunConfig | str | Path",
     *,
@@ -407,6 +459,7 @@ def run_multi_pipe(
 
     try:
         with _temporary_run_settings(run_dir, space_start, space_goal, shared_radius):
+            reused_space_path = None
             if reuse_space_json is None:
                 space = build_shared_space(space_start, space_goal, shared_radius, run_dir)
             else:
@@ -416,7 +469,13 @@ def run_multi_pipe(
                 print(f"[SPACE] reusing completed planning space: {space_path}", flush=True)
                 space = json.loads(space_path.read_text(encoding="utf-8"))
                 space["source_json"] = str(space_path)
+                reused_space_path = space_path
             import settings
+
+            if reused_space_path is not None:
+                # Engineering distance profiles read settings.SPACE_JSON;
+                # point it at the completed source when no copy is created.
+                settings.SPACE_JSON = reused_space_path
 
             validation_extra = float(getattr(settings, "ENGINEERING_VALIDATION_EXTRA_CLEARANCE", 2.0))
             collision_sections = (
@@ -431,6 +490,9 @@ def run_multi_pipe(
                 allow_inter_pipe_conflicts = bool(
                     _pipe_value(pipe, "allow_inter_pipe_conflicts", False)
                 )
+                allow_direct_guide_modeling = bool(
+                    _pipe_value(pipe, "allow_direct_guide_modeling", False)
+                )
                 collision_model = DualSectionModel(
                     collision_sections[0], collision_sections[1],
                     allow_hard=allow_hard_conflicts,
@@ -441,6 +503,7 @@ def run_multi_pipe(
                     "status": "running",
                     "allow_hard_conflicts": allow_hard_conflicts,
                     "allow_inter_pipe_conflicts": allow_inter_pipe_conflicts,
+                    "allow_direct_guide_modeling": allow_direct_guide_modeling,
                 }
                 manifest["pipes"].append(record)
 
@@ -467,8 +530,10 @@ def run_multi_pipe(
                             collision_model=collision_model,
                         )
                     except Exception as exc:
-                        failed_candidates.append({"name": candidate.get("name"), "stage": "engineering", "reason": str(exc)})
-                        continue
+                        if not allow_direct_guide_modeling:
+                            failed_candidates.append({"name": candidate.get("name"), "stage": "engineering", "reason": str(exc)})
+                            continue
+                        engineered = _direct_guide_engineering(candidate, pipe, str(exc))
                     final_reports = _clearance_against_reserved(pipe, engineered, reserved)
                     final_conflicts = _invalid_clearance_reports(final_reports)
                     if final_conflicts and not allow_inter_pipe_conflicts:
