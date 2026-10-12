@@ -45,7 +45,10 @@ def build_shared_space(start, goal, pipe_radius, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
     with _temporary_space_settings(start, goal, pipe_radius, output_dir):
         space = compute_planning_space(settings)
-        export_planning_space_html(space, settings, settings.SPACE_HTML)
+        # 多管流程可复用规划空间 JSON，避免把数亿字符的数据再次内嵌到
+        # HTML。单管入口默认仍生成原有预览。
+        if bool(getattr(settings, "WRITE_SPACE_HTML", True)):
+            export_planning_space_html(space, settings, settings.SPACE_HTML)
         space["source_json"] = str(settings.SPACE_JSON)
         return space
 

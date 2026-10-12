@@ -19,7 +19,13 @@ import numpy as np
 import settings
 from common_space import html_aspect_ratio, html_x_range, load_json, load_step_meshes_for_html, save_json
 from hanger_utils import hard_waypoint_report, hanger_distance_report, settings_hanger_points
-from main2 import DualSectionModel, joint_segment_allowed, joint_validate_path, section_polygons
+from main2 import (
+    DualSectionModel,
+    hard_conflict_report,
+    joint_segment_allowed,
+    joint_validate_path,
+    section_polygons,
+)
 
 
 ROUTE_COLORS = ["#ef2929", "#111827", "#2563eb", "#16a34a", "#f97316"]
@@ -1348,6 +1354,11 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     hard_report = hard_waypoint_report(sampled, hard_points, hard_names, tolerance=0.0)
     if not hard_report["all_within_tolerance"]:
         raise RuntimeError(f"{route_name}: engineered route does not pass every required guardian")
+    hard_conflicts = (
+        hard_conflict_report(collision_model, sampled)
+        if collision_model is not None else
+        {"count": 0, "components": [], "segments": [], "allowed": False}
+    )
 
     return {
         "name": route_name,
@@ -1399,6 +1410,9 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "constraint_report": constraint_report,
         "geometry_report": geometry_report,
         "collision_report": collision_report,
+        "hard_conflicts": hard_conflicts["segments"],
+        "hard_conflict_components": hard_conflicts["components"],
+        "hard_conflicts_allowed": bool(hard_conflicts["allowed"]),
         "hanger_distance": hanger_report,
         "hanger_valid": bool(hanger_report["all_within_range"]),
         "hard_waypoints": [point.tolist() for point in hard_points],
@@ -1479,6 +1493,7 @@ def make_engineering_params(pipe=None, collision_model=None) -> dict:
         "goal": value("goal", settings.GOAL),
         "start_dir": value("start_dir", settings.START_DIR_POINT),
         "goal_dir": value("goal_dir", settings.GOAL_DIR_POINT),
+        "allow_hard_conflicts": bool(value("allow_hard_conflicts", False)),
     }
 
 
@@ -1726,6 +1741,53 @@ DATA.routes.forEach((route, routeIndex) => {
     marker: { color: route.color, size: 3 },
     visible: false,
   });
+
+  const conflictX = [], conflictY = [], conflictZ = [];
+  const conflictComponents = new Set();
+  for (const conflict of (route.hard_conflicts || [])) {
+    const a = conflict.start || [];
+    const b = conflict.end || [];
+    if (a.length !== 3 || b.length !== 3) continue;
+    conflictX.push(a[0], b[0], null);
+    conflictY.push(a[1], b[1], null);
+    conflictZ.push(a[2], b[2], null);
+    for (const component of (conflict.components || [])) conflictComponents.add(component);
+  }
+  if (conflictX.length) {
+    addRouteTrace(routeIndex, "hardConflicts", {
+      type: "scatter3d",
+      mode: "lines+markers",
+      name: `${route.name} HARD CONFLICT: ${Array.from(conflictComponents).join(", ") || "hard boundary"}`,
+      x: conflictX, y: conflictY, z: conflictZ,
+      line: { color: "#dc2626", width: 12 },
+      marker: { color: "#dc2626", size: 5 },
+      hovertemplate: `${route.name} hard conflict<br>component=${Array.from(conflictComponents).join(", ") || "hard boundary"}<extra></extra>`,
+    });
+  }
+  const interferenceX = [], interferenceY = [], interferenceZ = [], interferenceText = [];
+  const interferencePipes = new Set();
+  for (const conflict of (route.inter_pipe_conflicts || [])) {
+    const a = conflict.closest_point_a || [];
+    const b = conflict.closest_point_b || [];
+    if (a.length !== 3 || b.length !== 3) continue;
+    interferenceX.push(a[0], b[0], null);
+    interferenceY.push(a[1], b[1], null);
+    interferenceZ.push(a[2], b[2], null);
+    interferenceText.push(conflict.minimum_clearance, conflict.minimum_clearance, null);
+    if (conflict.pipe_id_b) interferencePipes.add(conflict.pipe_id_b);
+  }
+  if (interferenceX.length) {
+    addRouteTrace(routeIndex, "interPipeConflicts", {
+      type: "scatter3d",
+      mode: "lines+markers",
+      name: `${route.name} PIPE INTERFERENCE: ${Array.from(interferencePipes).join(", ") || "reserved pipe"}`,
+      x: interferenceX, y: interferenceY, z: interferenceZ,
+      text: interferenceText,
+      line: { color: "#f97316", width: 14 },
+      marker: { color: "#f97316", size: 6, symbol: "x" },
+      hovertemplate: `${route.name} pipe interference<br>with=${Array.from(interferencePipes).join(", ") || "reserved pipe"}<br>minimum clearance=%{text:.2f} mm<extra></extra>`,
+    });
+  }
 });
 
 if (DATA.hanger_points && DATA.hanger_points.length) {
@@ -1766,6 +1828,8 @@ Plotly.newPlot("plot", traces, {
 const SUBITEMS = [
   ["pipe", "Pipe"],
   ["centerline", "Centerline"],
+  ["hardConflicts", "Hard conflicts"],
+  ["interPipeConflicts", "Pipe interference"],
   ["guide", "main2 Guide"],
   ["zGuide", "Z-smoothed Guide"],
   ["control", "Control Points"],
@@ -1773,6 +1837,8 @@ const SUBITEMS = [
 const defaultSubitemVisible = {
   pipe: true,
   centerline: true,
+  hardConflicts: true,
+  interPipeConflicts: true,
   guide: false,
   zGuide: false,
   control: false,

@@ -157,6 +157,8 @@ class PipeInstance:
     required_clearance: float = 0.0
     priority: int = 0
     required_hangers: tuple[GuardianPoint, ...] = ()
+    allow_hard_conflicts: bool = False
+    allow_inter_pipe_conflicts: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipe_id, str) or not self.pipe_id.strip():
@@ -177,6 +179,10 @@ class PipeInstance:
         )
         object.__setattr__(self, "priority", _priority(self.priority))
         object.__setattr__(self, "required_hangers", _guardians(self.required_hangers, "required_hangers"))
+        if not isinstance(self.allow_hard_conflicts, bool):
+            raise ValueError("allow_hard_conflicts must be a boolean")
+        if not isinstance(self.allow_inter_pipe_conflicts, bool):
+            raise ValueError("allow_inter_pipe_conflicts must be a boolean")
         if self.start == self.start_dir:
             raise ValueError("start_dir must differ from start")
         if self.goal == self.goal_dir:
@@ -212,6 +218,8 @@ class PipeInstance:
             required_clearance=value.get("required_clearance", 0.0),
             priority=value.get("priority", 0),
             required_hangers=value.get("required_hangers", ()),
+            allow_hard_conflicts=value.get("allow_hard_conflicts", False),
+            allow_inter_pipe_conflicts=value.get("allow_inter_pipe_conflicts", False),
         )
 
 

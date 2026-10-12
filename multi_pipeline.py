@@ -304,6 +304,9 @@ def _temporary_run_settings(run_dir: Path, space_start, space_goal, radius):
         "SPACE_JSON": run_dir / "planning_space.json",
         "SPACE_CHECKPOINT_JSON": run_dir / "planning_space_checkpoint.json",
         "SPACE_HTML": run_dir / "planning_space.html",
+        # 规划空间包含上亿个数值；多管流程默认只保留 JSON，避免 VS Code
+        # 解析超大内嵌 HTML 时耗尽内存。
+        "WRITE_SPACE_HTML": False,
         "BIDIR_RESULT_JSON": run_dir / "routes_guide.json",
         "BIDIR_HTML": run_dir / "routes_guide.html",
         "BIDIR_DISTANCE_PNG": run_dir / "routes_guide_distance.png",
@@ -346,6 +349,11 @@ def _clearance_against_reserved(pipe, route, reserved, sample_step: float = 20.0
     return reports
 
 
+def _invalid_clearance_reports(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep failed pipe-to-pipe checks for explicit green-light diagnostics."""
+    return [report for report in reports if not bool(report.get("valid", False))]
+
+
 def run_multi_pipe(
     config_or_path: "RunConfig | str | Path",
     *,
@@ -355,6 +363,7 @@ def run_multi_pipe(
     centerline_only: bool = False,
     catia_visible: bool = False,
     skip_catia: bool = False,
+    reuse_space_json: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the real sequential multi-pipe flow using the existing stages."""
     if isinstance(config_or_path, (str, Path)):
@@ -398,11 +407,19 @@ def run_multi_pipe(
 
     try:
         with _temporary_run_settings(run_dir, space_start, space_goal, shared_radius):
-            space = build_shared_space(space_start, space_goal, shared_radius, run_dir)
+            if reuse_space_json is None:
+                space = build_shared_space(space_start, space_goal, shared_radius, run_dir)
+            else:
+                space_path = Path(reuse_space_json).resolve()
+                if not space_path.is_file():
+                    raise FileNotFoundError(f"reused planning space JSON not found: {space_path}")
+                print(f"[SPACE] reusing completed planning space: {space_path}", flush=True)
+                space = json.loads(space_path.read_text(encoding="utf-8"))
+                space["source_json"] = str(space_path)
             import settings
 
             validation_extra = float(getattr(settings, "ENGINEERING_VALIDATION_EXTRA_CLEARANCE", 2.0))
-            collision_model = DualSectionModel(
+            collision_sections = (
                 section_polygons(space, "x", extra_clearance=validation_extra),
                 section_polygons(space, "y", extra_clearance=validation_extra),
             )
@@ -410,7 +427,21 @@ def run_multi_pipe(
                 pipe_id = _pipe_id(pipe, index)
                 pipe_dir = run_dir / pipe_id
                 pipe_dir.mkdir(parents=True, exist_ok=False)
-                record = {"pipe_id": pipe_id, "priority": _pipe_value(pipe, "priority"), "status": "running"}
+                allow_hard_conflicts = bool(_pipe_value(pipe, "allow_hard_conflicts", False))
+                allow_inter_pipe_conflicts = bool(
+                    _pipe_value(pipe, "allow_inter_pipe_conflicts", False)
+                )
+                collision_model = DualSectionModel(
+                    collision_sections[0], collision_sections[1],
+                    allow_hard=allow_hard_conflicts,
+                )
+                record = {
+                    "pipe_id": pipe_id,
+                    "priority": _pipe_value(pipe, "priority"),
+                    "status": "running",
+                    "allow_hard_conflicts": allow_hard_conflicts,
+                    "allow_inter_pipe_conflicts": allow_inter_pipe_conflicts,
+                }
                 manifest["pipes"].append(record)
 
                 planning_result = plan_pipe_routes(space, pipe)
@@ -421,7 +452,11 @@ def run_multi_pipe(
                 failed_candidates = []
                 for candidate in planning_result["routes"]:
                     guide_reports = _clearance_against_reserved(pipe, candidate, reserved)
-                    if any(not report["valid"] for report in guide_reports):
+                    guide_conflicts = _invalid_clearance_reports(guide_reports)
+                    # Pipe-to-pipe clearance remains a separate physical
+                    # acceptance rule; the obstacle green light does not waive
+                    # interference with an already selected pipe.
+                    if guide_conflicts and not allow_inter_pipe_conflicts:
                         failed_candidates.append({"name": candidate.get("name"), "stage": "planning", "clearance": guide_reports})
                         continue
                     try:
@@ -435,12 +470,19 @@ def run_multi_pipe(
                         failed_candidates.append({"name": candidate.get("name"), "stage": "engineering", "reason": str(exc)})
                         continue
                     final_reports = _clearance_against_reserved(pipe, engineered, reserved)
-                    if any(not report["valid"] for report in final_reports):
+                    final_conflicts = _invalid_clearance_reports(final_reports)
+                    if final_conflicts and not allow_inter_pipe_conflicts:
                         failed_candidates.append({"name": candidate.get("name"), "stage": "engineering", "clearance": final_reports})
                         continue
                     selected_guide = candidate
                     selected_engineered = engineered
                     selected_reports = guide_reports + final_reports
+                    selected_guide["inter_pipe_conflicts"] = guide_conflicts
+                    selected_engineered["inter_pipe_conflicts"] = final_conflicts
+                    selected_guide["allow_inter_pipe_conflicts"] = bool(allow_inter_pipe_conflicts)
+                    selected_engineered["allow_inter_pipe_conflicts"] = bool(allow_inter_pipe_conflicts)
+                    selected_guide["inter_pipe_conflicts_allowed"] = bool(allow_inter_pipe_conflicts)
+                    selected_engineered["inter_pipe_conflicts_allowed"] = bool(allow_inter_pipe_conflicts)
                     break
                 if selected_guide is None or selected_engineered is None:
                     record.update({"status": "failed", "failed_candidates": failed_candidates})
@@ -449,7 +491,15 @@ def run_multi_pipe(
 
                 _write_pipe_result(pipe_dir, "engineering", selected_engineered)
                 _write_pipe_result(pipe_dir, "clearance", selected_reports or [])
-                record.update({"status": "completed", "directory": str(pipe_dir), "failed_candidates": failed_candidates})
+                record.update({
+                    "status": "completed",
+                    "directory": str(pipe_dir),
+                    "failed_candidates": failed_candidates,
+                    "inter_pipe_conflicts_allowed": bool(
+                        selected_engineered.get("inter_pipe_conflicts_allowed", False)
+                    ),
+                    "inter_pipe_conflict_count": len(selected_engineered.get("inter_pipe_conflicts", [])),
+                })
                 reserved.append((pipe, selected_engineered))
                 guide_routes.append(selected_guide)
                 engineered_routes.append(selected_engineered)
@@ -503,6 +553,11 @@ def cli_main(argv=None) -> int:
     parser.add_argument("--centerline-only", action="store_true")
     parser.add_argument("--catia-visible", action="store_true")
     parser.add_argument("--skip-catia", action="store_true")
+    parser.add_argument(
+        "--reuse-space-json",
+        type=Path,
+        help="Reuse an existing completed planning_space.json and skip rebuilding the shared space.",
+    )
     args = parser.parse_args(argv)
     result = run_multi_pipe(
         args.config,
@@ -512,6 +567,7 @@ def cli_main(argv=None) -> int:
         centerline_only=args.centerline_only,
         catia_visible=args.catia_visible,
         skip_catia=args.skip_catia,
+        reuse_space_json=args.reuse_space_json,
     )
     print(f"MULTI_PIPE_RUN: {result['run_dir']}")
     return 0
