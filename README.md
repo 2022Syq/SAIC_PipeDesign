@@ -33,6 +33,14 @@ CATIA stage should create only the route centerline.
 - `pipeline.py`: runs point measurement, planning-space generation, route search, engineering reconstruction, and CATIA modeling.
 - `upload.py`: converts uploaded Part files to IGES files for `main1.py`.
 
+## 本地文件维护规则
+
+仓库把源码、测试和少量正式文档纳入 Git；CAD 输入、CATIA 模型、运行输出和工具缓存只保留在本机。`base/` 是 `occ_mesh.py` 读取的 IGES/STEP 输入，`model/` 是 CATIA 原始模型及装配引用，二者不能按普通临时文件清理，也不要直接改名或移动其中的装配件。
+
+`outputs/<run_id>/` 按运行编号隔离每次多管路结果。运行结束后保留 `manifest.json`、路线/验证 JSON 和需要复盘的诊断文件；`planning_space_checkpoint.json` 只是阶段快照，不能断点续算，完成后可以删除。规划空间 JSON、交互式 HTML 和图片都能由当前代码重新生成，失败或中断的旧运行只保留小型清单与诊断，避免重复占用磁盘。唯一完成运行需要完整保留时，应以其 `manifest.json` 的 `status` 为依据。
+
+清理前先执行 `git status --short --branch`，确认没有未提交源码；不要使用 `git clean -xdf`，因为它会连同本地 CAD、模型和运行结果一起删除。清理后使用 `python -m pytest -q`、`python -m py_compile` 和 `git diff --check` 验证代码边界。Git 提交只记录本规则和源码变化，不把本地二进制 CAD 或 `outputs/` 运行产物加入版本库。
+
 ## Environment
 
 The project expects an environment with OpenCascade/pythonocc support.
