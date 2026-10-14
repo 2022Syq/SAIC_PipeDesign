@@ -39,6 +39,8 @@ CATIA stage should create only the route centerline.
 
 `outputs/<run_id>/` 按运行编号隔离每次多管路结果。运行结束后保留 `manifest.json`、路线/验证 JSON 和需要复盘的诊断文件；`planning_space_checkpoint.json` 只是阶段快照，不能断点续算，完成后可以删除。规划空间 JSON、交互式 HTML 和图片都能由当前代码重新生成，失败或中断的旧运行只保留小型清单与诊断，避免重复占用磁盘。唯一完成运行需要完整保留时，应以其 `manifest.json` 的 `status` 为依据。
 
+当前本地运行结果采用两份代表性记录：保留 `outputs/run_20261001/` 作为旧单管基线，保留 `outputs/run_20261012_multi4_directguide_hard4_fix/` 作为最终多管路版本；其他 run 目录视为迭代产物，清理时可以整体删除。根目录的测点和多管配置 JSON 独立于 run 目录，按后续排障需要保留。
+
 清理前先执行 `git status --short --branch`，确认没有未提交源码；不要使用 `git clean -xdf`，因为它会连同本地 CAD、模型和运行结果一起删除。清理后使用 `python -m pytest -q`、`python -m py_compile` 和 `git diff --check` 验证代码边界。Git 提交只记录本规则和源码变化，不把本地二进制 CAD 或 `outputs/` 运行产物加入版本库。
 
 ## Environment
