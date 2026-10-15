@@ -161,12 +161,39 @@ class EngineeringGeometryTests(unittest.TestCase):
 
     def test_short_adjacent_bends_do_not_bypass_minimum_radius(self):
         guide = np.asarray([[0., 0, 0], [30., 0, 0], [30., 10, 0], [60., 10, 0]])
-        route = self.build(guide)
+        with self.assertRaisesRegex(RuntimeError, "uniform bend radius"):
+            self.build(guide)
+
+    def test_mixed_arc_radii_are_rejected_by_constraints(self):
+        route = self.build()
+        arc_indices = [
+            index for index, segment in enumerate(route["segments"])
+            if segment.get("type") == "arc"
+        ]
+        self.assertGreaterEqual(len(arc_indices), 2)
+        route["segments"][arc_indices[0]]["radius"] -= 1.0
         report = main3.validate_route_constraints(
             route["sampled_path"], route, main3.active_constraint_profile(),
         )
         self.assertFalse(report["valid"])
-        self.assertIn("bend_radius", {item["rule"] for item in report["hard_failures"]})
+        self.assertIn("uniform_bend_radius", {item["rule"] for item in report["hard_failures"]})
+
+    def test_distance_profile_uses_route_radius_and_keeps_signed_clearance(self):
+        space = {
+            "sections": [{
+                "x": 0.0,
+                "hard_obstacle_section_lines": [{"name": "obstacle", "lines": [[[0.0, 0.0], [0.0, 0.0]]]}],
+            }],
+        }
+        route = {
+            "name": "signed-clearance",
+            "color": "#000000",
+            "engineered_path": [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            "route_max_envelope_radius": 2.0,
+        }
+        profile = main3.distance_profile_for_route(space, route, "parts")
+        self.assertEqual(profile["route_envelope_radius"], 2.0)
+        self.assertTrue(all(value == -2.0 for value in profile["clearance"]))
 
     def test_engineer_route_exports_final_geometry_report(self):
         source = {

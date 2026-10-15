@@ -222,6 +222,12 @@ def validate_route_constraints(path: np.ndarray, engineered: dict, profile: dict
             "actual_mm": minimum_radius,
             "minimum_mm": profile["minimum_bend_radius"],
         })
+    if arc_radii and max(arc_radii) - min(arc_radii) > 1e-6:
+        hard_failures.append({
+            "rule": "uniform_bend_radius",
+            "radii_mm": arc_radii,
+            "maximum_spread_mm": max(arc_radii) - min(arc_radii),
+        })
 
     # 验收真实成形弯角，不能以控制点已简化代替验收；同圆分弧仍是一个弯。
     bends = physical_bends(engineered.get("segments", []))
@@ -722,6 +728,10 @@ def selected_source_routes(result: dict) -> list[dict]:
     return [route_by_name(result, source_name)]
 
 
+class UniformBendRadiusError(RuntimeError):
+    """A corner cannot be filleted with the route's one selected radius."""
+
+
 def fillet_corner(prev_pt, vertex, next_pt, radius: float, max_arc_deg: float, sample_deg: float):
     p0 = np.asarray(prev_pt, dtype=float)
     p1 = np.asarray(vertex, dtype=float)
@@ -741,9 +751,25 @@ def fillet_corner(prev_pt, vertex, next_pt, radius: float, max_arc_deg: float, s
     if abs(tan_half) < 1e-9:
         return None
 
+    radius = float(radius)
+    if radius <= 0.0:
+        raise ValueError("bend radius must be positive")
+
+    # A manufacturing bend has one centerline radius for the whole route.
+    # The old implementation silently shortened the tangent distance when a
+    # corner was too close to its neighbours, which changed this corner's
+    # actual radius and produced a sharp/incorrect engineered route. Reject
+    # that candidate instead; the caller may try another single radius for
+    # the complete route.
     preferred_d = radius * tan_half
     max_d = 0.45 * min(len_in, len_out)
-    d = min(preferred_d, max_d)
+    if preferred_d > max_d + 1e-6:
+        raise UniformBendRadiusError(
+            "uniform bend radius cannot fit corner: "
+            f"radius={radius:.6g} mm, required_tangent={preferred_d:.6g} mm, "
+            f"available_tangent={max_d:.6g} mm"
+        )
+    d = preferred_d
     if d <= 1e-6:
         return None
 
@@ -794,7 +820,9 @@ def fillet_corner(prev_pt, vertex, next_pt, radius: float, max_arc_deg: float, s
     return {
         "turn_angle_deg": float(turn_deg),
         "radius": float(actual_radius),
-        "radius_reduced": bool(actual_radius < radius - 1e-6),
+        # Kept for the existing HTML/JSON schema. Infeasible corners raise
+        # above instead of silently changing the bend radius.
+        "radius_reduced": False,
         "tangent_in": t1,
         "tangent_out": t2,
         "samples": np.asarray(samples, dtype=float),
@@ -1038,6 +1066,13 @@ def distance_profile_for_route(space: dict, route: dict, mode: str) -> dict:
     sections = space["sections"]
     xs = np.asarray([s["x"] for s in sections], dtype=float)
     y_max = float(getattr(settings, "DISTANCE_Y_MAX", 40.0))
+    # Use the radius that built this route's swept envelope. Falling back to
+    # the legacy setting keeps old single-route JSON readable, while current
+    # multi-pipe output carries route_max_envelope_radius.
+    route_radius = route.get("route_max_envelope_radius", route.get("pipe_radius"))
+    if route_radius is None:
+        route_radius = getattr(settings, "PIPE_RADIUS", 0.0)
+    route_radius = float(route_radius)
 
     x_values = []
     clearances = []
@@ -1047,17 +1082,20 @@ def distance_profile_for_route(space: dict, route: dict, mode: str) -> dict:
         yz = [float(p[1]), float(p[2])]
         best = 1e18
         for comp in comps:
-            best = min(best, distance_to_component_lines(yz, comp) - settings.PIPE_RADIUS)
+            best = min(best, distance_to_component_lines(yz, comp) - route_radius)
         if best >= 1e17:
             clearance = None
         else:
-            clearance = max(0.0, min(float(best), y_max))
+            # Preserve signed clearance so an intersection remains visibly
+            # negative in the HTML diagnostic profile.
+            clearance = min(float(best), y_max)
         x_values.append(float(p[0]))
         clearances.append(clearance)
 
     return {
         "name": route["name"],
         "color": route["color"],
+        "route_envelope_radius": route_radius,
         "x": x_values,
         "clearance": clearances,
     }
@@ -1294,23 +1332,30 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     used_control = None
     for control_candidate in control_options:
         for radius in radii:
-            candidate = build_line_arc_route(
-                control_candidate,
-                radius,
-                params["max_bend_angle_deg"],
-                params["arc_sample_angle_deg"],
-                params["min_corner_angle_deg"],
-                protected_points=hard_points,
-                protected_straight_min_mm=float(
-                    params.get("hard_waypoint_min_straight_mm", 15.0)
-                ),
-            )
+            try:
+                candidate = build_line_arc_route(
+                    control_candidate,
+                    radius,
+                    params["max_bend_angle_deg"],
+                    params["arc_sample_angle_deg"],
+                    params["min_corner_angle_deg"],
+                    protected_points=hard_points,
+                    protected_straight_min_mm=float(
+                        params.get("hard_waypoint_min_straight_mm", 15.0)
+                    ),
+                )
+            except UniformBendRadiusError:
+                # A corner that cannot fit this one radius invalidates the
+                # complete candidate. Try another global radius; never keep
+                # a route whose corners have different actual radii.
+                continue
             collision_report = (
                 joint_validate_path(collision_model, candidate["sampled_path"])
                 if collision_model is not None else None
             )
             clearance_ok = collision_report is None or (
                 collision_report["hard_bad_segments"] == 0
+                and collision_report.get("inter_pipe_bad_segments", 0) == 0
                 and (allow_soft or collision_report["soft_bad_segments"] == 0)
             )
             geometry_report = validate_engineered_geometry(

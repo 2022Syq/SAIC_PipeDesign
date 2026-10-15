@@ -69,6 +69,23 @@ flowchart TD
 
 后文依次说明配置与调度、模型和坐标准备、底层几何工具，以及 `main1` 到 `main4`。函数按功能成组列出，方便在 VS Code 中按 `Ctrl+F` 搜索函数名。
 
+## 1014 多管路整改契约
+
+多管入口对外只保留每条管路的一条路线；搜索内部可以尝试不同策略和局部回退。
+`completed` 必须同时满足：没有硬障碍冲突、没有管间扫掠包络相交、工程化几何有效，
+并且没有使用 fallback。允许硬冲突的配置只用于诊断，不能把冲突路线当作完成路线。
+
+当前障碍物额外净空、规划额外净空和工程化安全带均为 `0 mm`。`required_clearance=0`
+只表示不增加额外壁间隙；管外半径仍参与包络检查，负有符号净距表示实体相交并判定
+失败，零净距相切可以通过。起点、终点或硬挂点若小于两管外半径之和，报告为输入点位
+冲突。固定 `priority` 顺序下，程序先在当前管路内局部回退并尝试其他方向；穷尽后仍无解
+就记录阻塞原因、实际局部通道宽度、所需宽度和缺口值，并请示是否换序，不自动换序；两管之间则记录有符号包络净距和两管外半径之和对应的中心距要求。
+
+严格规划或工程化失败时，HTML 可以保留一条明确标记为诊断失败的路线供复盘，但不登记
+为已占用路线，也不生成正式 CATPart。工程化管子的外径沿全长一致，所有转弯都必须是
+圆弧并使用同一规定的中心线弯曲半径；相邻直段不足以容纳该半径时回退或失败，不能以
+尖角折线或缩小半径替代。
+
 
 ## settings.py：整个项目的参数控制面板
 
@@ -155,7 +172,7 @@ main2 的当前入口执行双 X/Y 截面格点 A* 搜索。格点是离散候�
 | `JOINT_HEURISTIC_WEIGHT` | 1.08 | 预计剩余距离的权重，偏大时更倾向朝目标搜索，不能等同数学最短路径保证。 |
 | `JOINT_ENDPOINT_TANGENT_LENGTH` | 30.0 | 起终点方向锚点的目标直线长度。 |
 | `JOINT_SMOOTH_LOOKAHEAD` | 80 | 简化折线时，向前尝试直连的节点窗口。 |
-| `MAIN2_EXTRA_CLEARANCE` | 20.0 | 对 main1 自由区域额外内缩的量，允许 0～20。主干采用该安全余量，固定端点及必要过渡可按原基础净空验收，因此不能解释成整条路线无条件都有额外 20 mm。 |
+| `MAIN2_EXTRA_CLEARANCE` | 0.0 | 本轮多管整改不叠加规划额外净空；管外半径和硬障碍边界仍参与验收。 |
 | `SOFT_BAD_WEIGHT` | 18000.0 | profile 的常规软边界惩罚默认值。 |
 | `ENGINEER_SOFT_BAD_WEIGHT` | 1800.0 | 第五种允许软边界方案采用的较低软惩罚。 |
 | `HARD_BAD_WEIGHT` | 260000.0 | 旧评分逻辑中的硬违规代价。当前主 A* 直接拒绝硬碰撞，不靠调整此值允许穿过硬障碍。 |
@@ -216,7 +233,7 @@ main2 中还有通过 `getattr(settings, 名称, 默认值)` 读取的可选参�
 | `ENGINEERING_MAX_TURN_COUNT` | 10 | 主布置转角数量的控制目标，主要用于限制中间控制点数；两端保护链另行保留，最终没有对报告转角数再执行一次上限检查。 |
 | `ENGINEERING_MIN_BEND_RADIUS` | 25.0 | 候选半径尝试列表的下限。`fillet_corner` 还可能因相邻直线短而缩小实际半径，当前未逐圆弧复核该下限，不能说最终所有圆弧实际半径都被硬保证不小于 25。 |
 | `ENGINEERING_BEND_RADIUS_STEP` | 10.0 | 候选圆角半径递减步长。 |
-| `ENGINEERING_VALIDATION_EXTRA_CLEARANCE` | 2.0 | 最终双截面验收的额外数值安全带，用于补偿近似误差。 |
+| `ENGINEERING_VALIDATION_EXTRA_CLEARANCE` | 0.0 | 本轮工程化与规划使用同一套实体外缘净空口径，不追加安全带。 |
 | `ENGINEERING_Z_SIMPLIFY_TOLERANCE` | 0.0 | Z 高度简化容差，0 表示关闭。 |
 | `ENGINEERING_MIN_SEGMENT_LENGTH` | 40.0 | 控制点清理时删除过近点的阈值，不等于最终每段制造直线长度均不小于 40 的验收保证。 |
 | `ENGINEERING_S_BEND_MIN_TURN_DEG` | 110.0 | S 形折返识别的转角条件。 |
@@ -671,7 +688,7 @@ STEP/IGES 文件先读取成 OCC 的 `Shape`，即 CAD 几何对象，再离散�
 输入：main1 的规划空间 JSON、`settings` 中的方向与搜索参数。主入口优先读 `SPACE_JSON`，没有时才读 `SPACE_CHECKPOINT_JSON`；检查点必须包含足够完整的两类截面才有意义。
 
 1. `section_polygons()` 把 JSON 中的自由区域重建为 Shapely 多边形。
-2. 按 `MAIN2_EXTRA_CLEARANCE` 向内缩自由区域，形成主干搜索模型；另建一份基础净空模型用于端点连接和最终基础验收。
+2. 按 `MAIN2_EXTRA_CLEARANCE` 向内缩自由区域，形成主干搜索模型；本轮值为 `0 mm`，因此不再叠加规划安全带，但管外半径和硬障碍仍由截面模型拒绝。
 3. `get_start_dir()`、`get_goal_dir()` 计算两端方向。
 4. `make_profiles()` 建立五种路线偏好。
 5. 对每种偏好建立端点方向锚点、连接格点，执行 A*，再尝试用可通行直线删去多余节点。
@@ -766,7 +783,8 @@ main2 使用的起终点优先来自规划空间 JSON，而方向点来自当前
 | A* 邻边 `sample_step=max(ROUTE_SEGMENT_SAMPLE_STEP,10.0)` | 当前邻边检查不会用小于 10 mm 的均匀采样步长；此外仍加入截面交点 |
 | `ROUTE_SEGMENT_SAMPLE_STEP` | 其他路径检查和 `DualSectionModel.segment_check()` 的默认步长目前为 8 mm |
 
-`MAIN2_EXTRA_CLEARANCE` 的 20 mm 是对已有自由区域向内收缩，既影响障碍旁空间，也影响规划区域边缘。端点锚点和连接段按基础净空模型处理，因此不能把“设置 20”理解成整条路径每处都另加了 20 mm。
+本轮 `MAIN2_EXTRA_CLEARANCE=0`，不对已有自由区域额外收缩。若后续把该值改为正数，
+必须重新运行 main2；它会同时影响障碍旁空间和规划区域边缘，不能只重画管体。
 
 ### 保留的旧双向搜索模块
 
@@ -838,12 +856,12 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 ### 执行步骤
 
 1. `selected_source_routes()` 决定处理哪些 main2 方案，默认全部。
-2. 从规划空间建立新的双截面检查模型，附加 `ENGINEERING_VALIDATION_EXTRA_CLEARANCE=2` mm 数值安全带。
+2. 从规划空间建立新的双截面检查模型；本轮 `ENGINEERING_VALIDATION_EXTRA_CLEARANCE=0`，工程化与规划使用同一套实体外缘净空口径。
 3. `engineer_route()` 读取导引点，识别 main2 标记的端点保护链。
 4. 尝试高度简化、RDP 简化、近点清理、S 弯和指定方案的摆动清理。
 5. 主流程再通过 `collision_constrained_control_path()` 选择每一条直连都安全、控制点数量受限的中间路径；它会覆盖前面部分简化结果，因此不是每个预处理参数都会直接改变最终形状。
-6. 从优先半径 150 mm 开始，按 10 mm 递减，最后尝试 25 mm，生成直线/圆弧候选；对夹角和采样净空进行检查。
-7. 成功则保存管体显示网格、圆弧段和报告；单条方案发生 `RuntimeError` 会放入 `failed_routes` 并跳过，全部失败则报错。
+6. 使用当前规格规定的中心线弯曲半径生成直线/圆弧候选；同一条管路所有转弯使用同一半径，并检查夹角、圆弧半径和采样净空。相邻直段不足以容纳该半径时，候选失败并回退，不缩小半径继续建模。
+7. 成功则保存管体显示网格、圆弧段和报告；严格方案全部失败时只保留 HTML 诊断路线，不生成正式 CATPart。
 
 还有一层控制路径回退：如果原始导引线点数不超过 `max_turn_count+2`，且与首选控制线不同，会把它加入第二候选；程序先尝试首选控制线的全部半径，再尝试这条原始导引线。
 
@@ -893,16 +911,16 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 
 **第一组：半径。** `PIPE_RADIUS=25` mm 表示管外径为 50 mm；`ENGINEERING_BEND_RADIUS=150` mm 表示优先采用 R150 的中心线弯曲。
 
-外层搜索会按 `ENGINEERING_MIN_BEND_RADIUS` 限制尝试半径，但 `fillet_corner()` 还会根据相邻线段长度缩小实际圆角：
+当前整改要求所有最终圆弧都满足规格半径，且同一条管路的转弯半径一致。若相邻线段太短，
+正确处理是拒绝当前控制折线并回退，而不是缩小圆角：
 
 ```text
-希望占用的切向长度 = 尝试半径 × tan(转向角 / 2)
-允许占用的切向长度 = 0.45 × min(前一段长度, 后一段长度)
-实际切向长度 = 两者中的较小者
-实际圆角半径 = 实际切向长度 / tan(转向角 / 2)
+所需切向长度 = 规定弯曲半径 × tan(转向角 / 2)
+若前后直段不能同时容纳所需切向长度，则该转角不可行
 ```
 
-因此 `ENGINEERING_MIN_BEND_RADIUS=25` 并不保证每一个最终圆弧的 `radius` 都≥25。当前没有在输出前逐圆弧重新检查这个下限。JSON 根对象的 `bend_radius` 保存配置首选值；每条 `routes[i].bend_radius` 才是该路线选中的尝试半径；实际圆弧半径应看该路线各个 `segments` 中的 `radius`。
+因此 JSON 中路线的 `bend_radius` 必须与该管路实际所有圆弧的 `segments[].radius` 一致；
+出现半径缩小、尖角折线或无法形成相切圆弧时，路线只能作为诊断结果。
 
 **第二组：角度。** `ENGINEERING_MAX_BEND_ANGLE_DEG=90` 当前同时被传入两个位置：内部夹角最小值，以及单段圆弧最大分段角。它不是一个语义单一的“最大转弯角”开关。直线继续前进时内部夹角接近 180°，直角转弯内部夹角为 90°；内部夹角越小，回折越尖。
 
@@ -921,8 +939,8 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 | `engineered_path` | 直线和圆弧采样成的点列，用于显示及离散检查 |
 | `segments` | 真正交给 main4 的几何描述：`line` 含起终点；`arc` 另含圆心、实际半径和圆弧角 |
 | `tube_mesh` | 管体显示用三角网格，没有壁厚、材料或制造属性 |
-| 路线内 `requested_bend_radius`、`bend_radius` | 用户首选半径与该路线选中尝试半径，不等同所有圆弧实际半径；JSON 根对象的 `bend_radius` 仍是配置首选值 |
-| `radius_reduced_count` | 因局部长度不足而缩小半径的转角数量 |
+| 路线内 `requested_bend_radius`、`bend_radius` | 该管路规定的中心线弯曲半径；正式路线中所有圆弧的实际 `segments[].radius` 必须与之相同 |
+| `radius_reduced_count` | 正式路线必须为 `0`；若无法保持统一半径则路线失败并转为诊断 |
 | `arc_count`、`turn_count`、`main_turn_count` | 圆弧段数、生成圆角的转角数；当前 `main_turn_count` 与 `turn_count` 完全相同；一个转角可能拆成多段圆弧 |
 | `corner_angle_valid`、`corner_angle_violations` | 控制折线内部夹角检查及不满足项 |
 | `endpoint_tangent_protected` | 是否识别并保留 main2 的两端保护链 |
@@ -939,7 +957,9 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 
 第二，`build_line_arc_route()` 会跳过控制折线第一个和最后一个内部顶点的圆角化，以保留端点连接结构；多管硬挂点也会被保留为实际中心线点并跳过该点圆角化。因此硬点若恰好是转角，可能因 G1 切向不连续而被工程化验收拒绝；当前支持的安全语义是硬点落在可通过的直线段上。
 
-第三，工程化检查是在原规划空间上重新增加 2 mm 安全带；它并不是在 main2 的额外 20 mm 上继续加 2 mm。因此 main2 与 main3 的额外安全余量不能简单相加成全路径 22 mm。
+第三，本轮整改将障碍物额外净空、`MAIN2_EXTRA_CLEARANCE` 和
+`ENGINEERING_VALIDATION_EXTRA_CLEARANCE` 都设为 `0 mm`。这只取消额外壁间隙，不取消
+管外半径；有符号净距小于 `0` 仍是实体相交，工程化不能比规划阶段更宽松。
 
 第四，圆角和直段生成不等于所有水管工艺已实现。当前没有完整的焊缝位置、阀座直段、套管避让、壁厚，以及刚性管失败后软管替代等制造功能模块。这些需在后续明确规则后接入；本文不把它们当成现成功能。
 
@@ -993,7 +1013,9 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 
 ### 输出行为需要知道的细节
 
-如果扫掠失败，代码会打印警告，仍保存已生成的节点和线/圆弧中心线。因此 CATPart 文件存在，不等于完整管体扫掠一定成功。
+如果扫掠失败，中心线可以作为诊断证据保留在 HTML/JSON，但多管编排不会把它标成正式
+完成，也不会为该失败路线生成正式 CATPart。只有扫掠和几何验收都通过的路线才进入
+`main4.create_catia_part()`。
 
 `create_circular_sweep()` 使用 `HybridShapeFactory` 的圆形扫掠；代码没有建立内径、壁厚或完整空心管制造特征。仅凭日志中的“pipe created”不能确认已经获得带壁厚的可制造实体。
 

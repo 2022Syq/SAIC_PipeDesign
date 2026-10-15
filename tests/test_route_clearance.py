@@ -33,6 +33,17 @@ def test_swept_envelopes_fail_when_wall_gap_is_too_small():
     assert report["valid"] is False
 
 
+def test_zero_extra_gap_accepts_exactly_tangent_swept_envelopes():
+    report = check_route_clearance(
+        [[0, 0, 0], [100, 0, 0]], 2,
+        [[0, 5, 0], [100, 5, 0]], 3,
+        required_clearance=0,
+    )
+    assert report["minimum_clearance"] == pytest.approx(0)
+    assert report["required_clearance"] == pytest.approx(0)
+    assert report["valid"] is True
+
+
 def test_pipe_clearance_uses_each_spec_radius_and_required_clearance():
     first = PipeInstance.from_dict({
         "pipe_id": "a", "start": [0, 0, 0], "goal": [100, 0, 0],

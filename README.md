@@ -95,6 +95,10 @@ Create a JSON file with one object per pipe. `pipe_spec` must match an ID in
 `settings.PIPE_SPECS`; `required_clearance` is the additional wall-to-wall gap
 between two pipe envelopes. Set it to `0.0` when no extra inter-pipe gap is
 required—the two outside radii are still included in the swept-envelope check.
+The outside diameter is the full pipe width; the outside radius is half that
+diameter and is the value used to build each swept envelope. A zero gap allows
+exact tangency, while a negative signed gap means the pipe envelopes intersect
+and the route fails.
 
 ```json
 {
@@ -140,6 +144,44 @@ python multi_pipeline.py config\multi_pipe.json --points outputs\measured_points
 `GUADIAN_01#1` and `GUADIAN_02#1` are named CATIA points, not the solid bracket itself. A
 multi-pipe required hanger is inserted into the guide route as a hard waypoint;
 the legacy single-pipe `HANGER_POINTS` setting remains a distance report.
+
+### Multi-pipe acceptance and diagnostic results
+
+The multi-pipe runner keeps one route per pipe in the delivered result. Search
+may try several local strategies internally, but a route is marked
+`completed` only when all of these checks pass: no hard obstacle conflict, no
+negative inter-pipe swept-envelope clearance, valid engineering geometry, and
+no engineering fallback. `allow_hard_conflicts` is useful for a diagnostic
+attempt when the obstacle model is uncertain; it never turns a hard-conflict
+route into a completed route.
+
+All extra clearances are currently `0 mm`: the pipe outside radius still
+counts, so `required_clearance: 0.0` does not permit overlap. If a candidate
+hits an already accepted pipe, the runner tries local backtracking and other
+directions for the current pipe. The configured priority order stays fixed. If
+the local search is exhausted, the result records the blocking reason and
+asks for a possible reorder instead of changing the order automatically.
+
+When strict planning or engineering fails, the HTML viewer still contains one
+diagnostic route so the failure can be inspected. It is explicitly marked as
+diagnostic/failed and is never sent to CATIA. A pipe with an endpoint, goal, or
+hard hanger point already closer than the sum of the two outside radii is
+reported as an input point conflict; it is not silently treated as a valid
+exception.
+
+The same failure details are kept in the existing `manifest.json` and route
+JSON files: `blocking_reasons`, `channel_report`, `input_point_conflicts`, and
+`reorder_recommendation`. The runner keeps the configured order and only asks
+for a reorder after that order is exhausted.
+
+Engineering routes use a constant outside diameter and circular bends with
+the same required centerline bend radius. A turn whose adjacent straight
+segments cannot accommodate that radius is rejected and retried through local
+backtracking; a sharp polyline or a reduced-radius corner is diagnostic only.
+When a narrow passage is the cause, the report includes the actual local
+free-space width, the current pipe's required width, and the width deficit.
+Pipe-to-pipe checks separately report the signed clearance against the sum of
+both outside radii.
 
 `upload.py` requires CATIA and `pywin32`. By default it scans `upload/` for
 `.CATPart`, `.CATProduct`, `.part`, and `.prt` files, then exports `.igs` files
