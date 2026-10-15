@@ -19,9 +19,9 @@
 
 `settings.py` 新增 4 种金属管和 3 种胶管规格，记录外径、内径、壁厚、刚性/柔性、弯曲半径和直线段要求。规格 ID 为 `metal_9`、`metal_12`、`metal_16`、`metal_19_05`、`hose_8DE3`、`hose_11DE3`、`hose_15DE3`，对应 SAAA 工艺表中的管径和材料；当前主动连续芯管为 `metal_19_05`。
 
-- 金属管弯曲半径按 `max(Excel 明确值, 1.5D)` 形成硬下限。
-- 胶管使用 R50、R60、R75 的规格硬下限。
-- 半径碰撞失败时每次递减 10 mm，但不允许低于当前规格硬下限。
+- SAAA 表中的 R15、R20 等是最低中心线弯曲半径；金属管按 `max(Excel 明确值, 1.5D)` 形成硬下限，胶管的 R50、R60、R75 也作为最低值使用，实际半径可以更大。
+- `recommended_bend_radius` 只作搜索参考，`minimum_bend_radius` 是工程化硬下限；同一路线统一采用一个最终选定半径。
+- 普通路线按 `ENGINEERING_BEND_RADIUS_STEP` 在参考值和硬下限之间搜索；超过 90° 的大转弯按 `ENGINEERING_ADAPTIVE_BEND_RADIUS_STEP_MM=1 mm` 在几何切线余量内搜索更大候选，始终不低于硬下限。
 - 小于 5° 的几何变化合并为直线；5°～10°允许，但加入评分惩罚。
 - 焊点按中心线累计距离检查，推荐 30 mm、极限 25 mm。
 - 阀座两侧分别检查直线段，推荐 25 mm、极限 5 mm。
@@ -66,7 +66,7 @@
 - `python -m py_compile settings.py common_space.py main2.py main3.py main4.py pipeline.py`
 - `git diff --check`
 - `pipeline.py --dry-run`
-- 规格表、R28.575 硬下限和半径递减逻辑检查
+- 规格表最低值、`metal_19_05` 的 R28.575 硬下限及半径候选搜索逻辑检查；最终半径允许高于该下限
 - 5°以下转角合并检查
 - 软障碍关闭检查
 - 铝套 R80/R65 检查函数检查

@@ -73,7 +73,7 @@ The active single-pipe specification is `settings.ACTIVE_PIPE_SPEC`. The
 available IDs mirror the SAAA table in
 [`doc/SAAA工艺要求-20260706.xlsx`](doc/SAAA工艺要求-20260706.xlsx):
 
-| ID | Type | Outside diameter | Recommended / minimum bend radius | Recommended / minimum straight length |
+| ID | Type | Outside diameter | SAAA value / enforced minimum bend radius | Recommended / minimum straight length |
 |---|---|---:|---:|---:|
 | `metal_9` | 3003 H14 metal | 9 mm | R15 / R15 | 13.5 / 9 mm |
 | `metal_12` | 3003 H14 metal | 12 mm | R20 / R20 | 18 / 12 mm |
@@ -82,6 +82,22 @@ available IDs mirror the SAAA table in
 | `hose_8DE3` | 8DE3 hose | 15 mm | R50 / R50 | local cover metadata |
 | `hose_11DE3` | 11DE3 hose | 19 mm | R60 / R60 | local cover metadata |
 | `hose_15DE3` | 15DE3 hose | 24 mm | R75 / R75 | local cover metadata |
+
+SAAA radii such as R15 and R20 are **minimum requirements**: the actual
+centerline bend radius may equal or exceed them. For metal pipes the enforced
+minimum is `max(SAAA minimum, 1.5 × outside diameter)`. In `PIPE_SPECS`,
+`minimum_bend_radius` is the hard limit; `recommended_bend_radius` supplies a
+search reference, raised to at least that limit. It is not a fixed result or
+an upper bound. The selected radius must also fit the straight lengths,
+endpoint tangents, hard hangers and clearance constraints.
+
+For turns above 90°, `ENGINEERING_ADAPTIVE_BEND_RADIUS_STEP_MM=1.0` searches
+larger radii within the estimated tangent room, trying larger candidates
+first for each control path. One selected radius is used throughout each route.
+The current `PIPE_03` result uses **R22 with a minimum of R15** (`metal_9`).
+Read a route's `bend_radius` for its selected radius and
+`requested_bend_radius` for its search reference; `segments[].radius` must
+match the selected radius. The reference value need not match the result.
 
 The planning envelope uses the largest selected outside radius. The current
 active value is `metal_19_05`, so `PIPE_DIAMETER=19.05` mm and
@@ -175,9 +191,11 @@ JSON files: `blocking_reasons`, `channel_report`, `input_point_conflicts`, and
 for a reorder after that order is exhausted.
 
 Engineering routes use a constant outside diameter and circular bends with
-the same required centerline bend radius. A turn whose adjacent straight
-segments cannot accommodate that radius is rejected and retried through local
-backtracking; a sharp polyline or a reduced-radius corner is diagnostic only.
+one selected centerline bend radius per route. That selected radius must be
+at least the SAAA minimum. A turn whose adjacent straight segments cannot
+accommodate a candidate radius is rejected and retried with another candidate
+or control path; a sharp polyline or a reduced-radius corner is diagnostic
+only.
 When a narrow passage is the cause, the report includes the actual local
 free-space width, the current pipe's required width, and the width deficit.
 Pipe-to-pipe checks separately report the signed clearance against the sum of
