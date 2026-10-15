@@ -3,10 +3,19 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from multi_pipeline import StageAdapterRequired, cli_main, run_pipeline
+from multi_pipeline import (
+    StageAdapterRequired,
+    _channel_width_report,
+    _point_conflict_reports,
+    cli_main,
+    run_pipeline,
+)
+from main4 import create_catia_part
+from shapely.geometry import Polygon
 
 
 @dataclass
@@ -105,6 +114,60 @@ def test_cli_passes_points_file_to_multi_run(monkeypatch, tmp_path):
                 "centerline_only": False,
                 "catia_visible": False,
                 "skip_catia": True,
+                "reuse_space_json": None,
             },
         )
     ]
+
+
+def test_point_conflicts_identify_input_measurements_before_routing():
+    left = SimpleNamespace(
+        pipe_id="A",
+        outer_radius=5.0,
+        start=(0.0, 0.0, 0.0),
+        goal=(100.0, 0.0, 0.0),
+        required_hangers=(),
+    )
+    right = SimpleNamespace(
+        pipe_id="B",
+        outer_radius=4.0,
+        start=(8.0, 0.0, 0.0),
+        goal=(100.0, 50.0, 0.0),
+        required_hangers=(),
+    )
+
+    reports = _point_conflict_reports([left, right])
+
+    assert reports[0]["type"] == "point_conflict"
+    assert reports[0]["point_a"] == "A.start"
+    assert reports[0]["point_b"] == "B.start"
+    assert reports[0]["center_distance"] == pytest.approx(8.0)
+    assert reports[0]["required_center_distance"] == pytest.approx(9.0)
+
+
+def test_catia_export_blocks_diagnostic_route_before_connecting_to_catia(tmp_path):
+    with pytest.raises(ValueError, match="diagnostic or non-exportable"):
+        create_catia_part(
+            {"name": "diagnostic", "diagnostic_only": True},
+            tmp_path / "diagnostic.CATPart",
+            4.0,
+            False,
+            False,
+        )
+
+
+def test_channel_report_exposes_available_required_and_gap_widths():
+    model = SimpleNamespace(
+        x_values=[0.0],
+        y_values=[0.0],
+        x_sections=[{"polys": [Polygon([(-10, -10), (10, -10), (10, 10), (-10, 10)])]}],
+        y_sections=[{"polys": [Polygon([(-10, -10), (10, -10), (10, 10), (-10, 10)])]}],
+        _nearest_index=lambda _values, _value: 0,
+    )
+    pipe = SimpleNamespace(outer_radius=4.0, required_clearance=0.0)
+
+    report = _channel_width_report(model, [[0.0, 0.0, 0.0]], pipe)
+
+    assert report["available_width_mm"] == pytest.approx(20.0)
+    assert report["required_width_mm"] == pytest.approx(8.0)
+    assert report["gap_mm"] == pytest.approx(12.0)

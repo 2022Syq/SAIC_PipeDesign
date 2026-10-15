@@ -5,7 +5,7 @@ import main2
 
 def test_plan_pipe_routes_continues_after_one_profile_runtime_failure(monkeypatch):
     class FakeModel:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
     profiles = [

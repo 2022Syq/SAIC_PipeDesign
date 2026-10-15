@@ -360,6 +360,18 @@ def save_part_document(catia, part_doc, output: Path) -> Path:
 
 
 def create_catia_part(route: dict, output: Path, radius: float, visible: bool, centerline_only: bool) -> None:
+    # CATIA is the final export boundary. A route explicitly marked as a
+    # diagnostic or carrying collision evidence must never be turned into a
+    # formal CATPart, even when this function is called directly.
+    if route.get("diagnostic_only") or route.get("formal_valid") is False or route.get("exportable") is False:
+        raise ValueError("diagnostic or non-exportable routes cannot generate CATPart")
+    if route.get("hard_conflicts") or route.get("inter_pipe_conflicts"):
+        raise ValueError("routes with hard or inter-pipe conflicts cannot generate CATPart")
+    for key in ("geometry_report", "constraint_report"):
+        report = route.get(key)
+        if isinstance(report, dict) and report.get("valid") is False:
+            raise ValueError(f"route {key} is invalid; CATPart export is blocked")
+
     win32 = import_catia_client()
     catia = win32.Dispatch("CATIA.Application")
     catia.Visible = bool(visible)
@@ -408,7 +420,10 @@ def create_catia_part(route: dict, output: Path, radius: float, visible: bool, c
             part.Update()
             print("[CATIA] circular sweep pipe created")
         except Exception as exc:
-            print(f"[WARN] circular sweep failed; nodes and line/arc centerline were kept. {exc}")
+            raise RuntimeError(
+                f"CATIA circular sweep failed for formally valid route {route_name}; "
+                "the CATPart was not saved"
+            ) from exc
 
     save_part_document(catia, part_doc, output)
 
