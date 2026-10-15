@@ -306,6 +306,14 @@ ENGINEERING_VALIDATION_EXTRA_CLEARANCE = 0.0
 # Main3 的 Z 高度简化容差（mm）。0 表示关闭，防止无碰撞约束的 Z 插值侵入车身。
 ENGINEERING_Z_SIMPLIFY_TOLERANCE = 0.0
 ENGINEERING_MIN_SEGMENT_LENGTH = 40.0
+# 圆弧切入两侧仍保留的最小直线长度。旧的固定 45% 限制会误拒绝端部
+# 30 mm 切向锚点后的可制造 R15 圆弧，因此改为显式可审计的残余直线。
+ENGINEERING_FILLET_MIN_STRAIGHT_MM = 5.0
+# 含真实大转角的路线按该步长搜索可制造统一半径，最终上限由各角切线余量决定。
+ENGINEERING_ADAPTIVE_BEND_RADIUS_STEP_MM = 1.0
+# 物理转角超过该值时视为需要圆弧处理的大弯，不再按补角阈值判为尖角；
+# 最终仍由统一弯曲半径、净空和端点连续性验收。
+ENGINEERING_ALLOW_LARGE_TURN_AFTER_DEG = 90.0
 # 硬挂点中心线两侧的最小直线长度；挂点处必须沿同一切向穿过。
 ENGINEERING_HARD_WAYPOINT_MIN_STRAIGHT_MM = 15.0
 ENGINEERING_S_BEND_MIN_TURN_DEG = 110.0

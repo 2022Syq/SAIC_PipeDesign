@@ -222,6 +222,49 @@ class EngineeringGeometryTests(unittest.TestCase):
         self.assertIn("collision_report", result)
         self.assertIsNone(result["collision_report"])
 
+    def test_large_turn_adapts_radius_and_removes_short_endpoint_connector(self):
+        # 管3式路径：端部切向锚点后只有约 11 mm 的短连接段，挂点必须保持
+        # 直线穿过；统一 R15 会失败，工程化应在实际切线余量内选择更大的半径。
+        guide = np.asarray([
+            [-6.8618677, 396.8954579, 392.9177502],
+            [-6.8618660, 404.5685038, 363.9156060],
+            [-6.8618677, 410.0, 354.5],
+            [93.1381323, 370.0, 394.5],
+            [193.1381323, 190.0, 394.5],
+            [238.4519063, 31.9997761, 330.2254978],
+            [213.1381323, 10.0, 414.5],
+            [273.4519063, -18.0002245, 440.2254431],
+            [303.4519063, -18.0002250, 440.2253962],
+        ])
+        guardian = guide[5].tolist()
+        source = {
+            "name": "PIPE_03_large_turn",
+            "path": guide.tolist(),
+            "search": {"endpoint_tangency": {
+                "applied": True,
+                "start": {"curve_point_count": 3},
+                "goal": {"curve_point_count": 3},
+            }},
+        }
+        params = main3.make_engineering_params({
+            "pipe_id": "PIPE_03",
+            "pipe_spec": "metal_9",
+            "outer_radius": 4.5,
+            "required_hangers": [{"name": "GUADIAN_03#1", "point": guardian}],
+            "start": guide[0].tolist(),
+            "goal": guide[-1].tolist(),
+            "start_dir": guide[1].tolist(),
+            "goal_dir": [333.4519063, -18.0002254, 440.2253494],
+        })
+        result = main3.engineer_route(source, "#2563eb", params)
+        self.assertGreater(result["bend_radius"], 15.0)
+        self.assertEqual(result["radius_selection"], "largest_feasible_for_large_turn")
+        self.assertGreater(result["arc_count"], 0)
+        self.assertTrue(result["geometry_report"]["valid"])
+        self.assertTrue(result["constraint_report"]["valid"])
+        self.assertTrue(result["protected_waypoint_geometry"]["valid"])
+        self.assertNotIn(guide[2].tolist(), result["control_path"])
+
 
 if __name__ == "__main__":
     unittest.main()
