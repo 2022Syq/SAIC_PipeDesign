@@ -83,6 +83,8 @@ def active_constraint_profile(spec_id: str | None = None, envelope_radius: float
         spec_ids = sorted(spec_ids)
     # 当前运行按一个主动金属规格工程化；胶管规格先保留在分段元数据中，
     # 等工程师提供区间后再对局部中心线应用胶管半径。
+    # SAAA 半径是最低要求。recommended 仅作搜索参考，并提升到硬下限；
+    # preferred 不限制最终半径上限，大转角搜索可以选用更大的统一半径。
     preferred = max(
         float(spec.get("recommended_bend_radius", 0.0)),
         float(spec.get("minimum_bend_radius", 0.0)),
@@ -1630,6 +1632,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "goal": route_goal.tolist(),
         "color": color,
         "bend_radius": float(used_radius),
+        # 搜索参考值与最终值分别记录；实际圆弧半径以 bend_radius 为准。
         "requested_bend_radius": float(preferred_radius),
         "active_pipe_spec": constraint_profile["active_spec"],
         "core_spec": constraint_profile["core_spec"],

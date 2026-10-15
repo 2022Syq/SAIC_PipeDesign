@@ -83,8 +83,8 @@ flowchart TD
 
 严格规划或工程化失败时，HTML 可以保留一条明确标记为诊断失败的路线供复盘，但不登记
 为已占用路线，也不生成正式 CATPart。工程化管子的外径沿全长一致，所有转弯都必须是
-圆弧并使用同一规定的中心线弯曲半径；相邻直段不足以容纳该半径时回退或失败，不能以
-尖角折线或缩小半径替代。
+圆弧并使用同一条路线选定的中心线弯曲半径；该半径不小于规格最低值。相邻直段不足以
+容纳候选半径时回退或失败，不能以尖角折线或缩小单个圆角替代。
 
 
 ## settings.py：整个项目的参数控制面板
@@ -226,13 +226,15 @@ main2 中还有通过 `getattr(settings, 名称, 默认值)` 读取的可选参�
 | 参数 | 当前值 | 用途 |
 |---|---|---|
 | `ENGINEERING_SOURCE_ROUTE_NAME` | None | None 表示处理所有 main2 方案；可指定一个方案名。 |
-| `ENGINEERING_BEND_RADIUS` | 150.0 | 优先尝试的中心线圆角半径。 |
+| `ENGINEERING_BEND_RADIUS` | 150.0 | 旧 route JSON 缺少规格半径字段时的几何兜底；当前 SAAA 主流程使用 `PIPE_SPECS`，不是固定最终半径。 |
 | `ENGINEERING_MAX_BEND_ANGLE_DEG` | 90.0 | 当前同时用作最小内部夹角和单段圆弧最大分段角。名字只表达了其中一层含义。 |
 | `ENGINEERING_ARC_SAMPLE_ANGLE_DEG` | 4.0 | 圆弧离散采样的角间隔。 |
 | `ENGINEERING_SIMPLIFY_TOLERANCE` | 25.0 | RDP 控制折线简化容差。 |
 | `ENGINEERING_MAX_TURN_COUNT` | 10 | 主布置转角数量的控制目标，主要用于限制中间控制点数；两端保护链另行保留，最终没有对报告转角数再执行一次上限检查。 |
-| `ENGINEERING_MIN_BEND_RADIUS` | 25.0 | 候选半径尝试列表的下限。`fillet_corner` 还可能因相邻直线短而缩小实际半径，当前未逐圆弧复核该下限，不能说最终所有圆弧实际半径都被硬保证不小于 25。 |
-| `ENGINEERING_BEND_RADIUS_STEP` | 10.0 | 候选圆角半径递减步长。 |
+| `ENGINEERING_MIN_BEND_RADIUS` | 25.0 | 历史保留参数，当前主流程不使用；实际硬下限来自当前规格的 `minimum_bend_radius`。 |
+| `ENGINEERING_BEND_RADIUS_STEP` | 10.0 | 普通路线从搜索参考值向规格硬下限递减的候选步长；不会把正式圆弧降到硬下限以下。 |
+| `ENGINEERING_ALLOW_LARGE_TURN_AFTER_DEG` | 90.0 | 超过该物理转角时启用大转弯处理和自适应半径候选。 |
+| `ENGINEERING_ADAPTIVE_BEND_RADIUS_STEP_MM` | 1.0 | 大转弯半径候选的搜索步长；候选下限仍是规格硬下限，上界由各角切线余量估算。 |
 | `ENGINEERING_VALIDATION_EXTRA_CLEARANCE` | 0.0 | 本轮工程化与规划使用同一套实体外缘净空口径，不追加安全带。 |
 | `ENGINEERING_Z_SIMPLIFY_TOLERANCE` | 0.0 | Z 高度简化容差，0 表示关闭。 |
 | `ENGINEERING_MIN_SEGMENT_LENGTH` | 40.0 | 控制点清理时删除过近点的阈值，不等于最终每段制造直线长度均不小于 40 的验收保证。 |
@@ -860,7 +862,7 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 3. `engineer_route()` 读取导引点，识别 main2 标记的端点保护链。
 4. 尝试高度简化、RDP 简化、近点清理、S 弯和指定方案的摆动清理。
 5. 主流程再通过 `collision_constrained_control_path()` 选择每一条直连都安全、控制点数量受限的中间路径；它会覆盖前面部分简化结果，因此不是每个预处理参数都会直接改变最终形状。
-6. 使用当前规格规定的中心线弯曲半径生成直线/圆弧候选；同一条管路所有转弯使用同一半径，并检查夹角、圆弧半径和采样净空。相邻直段不足以容纳该半径时，候选失败并回退，不缩小半径继续建模。
+6. 以当前规格的最低中心线弯曲半径为硬下限，从搜索参考值和几何可行范围生成候选；同一条管路所有转弯使用同一选定半径，并检查夹角、圆弧半径和采样净空。相邻直段不足以容纳某个候选时，候选失败并回退，不把单个圆角缩小后继续建模。
 7. 成功则保存管体显示网格、圆弧段和报告；严格方案全部失败时只保留 HTML 诊断路线，不生成正式 CATPart。
 
 还有一层控制路径回退：如果原始导引线点数不超过 `max_turn_count+2`，且与首选控制线不同，会把它加入第二候选；程序先尝试首选控制线的全部半径，再尝试这条原始导引线。
@@ -909,18 +911,19 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 
 ### 三组最容易混淆的参数
 
-**第一组：半径。** `PIPE_RADIUS=25` mm 表示管外径为 50 mm；`ENGINEERING_BEND_RADIUS=150` mm 表示优先采用 R150 的中心线弯曲。
+**第一组：半径。** `PIPE_RADIUS=25` mm 表示管外径为 50 mm。SAAA 中的 R15、R20 等是最低中心线弯曲半径，不是最终固定值；例如 `metal_9` 的 R15 最低要求可以通过 R22 满足。`ENGINEERING_BEND_RADIUS=150` mm 只为缺少规格半径字段的旧 route JSON 提供几何兜底。
 
-当前整改要求所有最终圆弧都满足规格半径，且同一条管路的转弯半径一致。若相邻线段太短，
-正确处理是拒绝当前控制折线并回退，而不是缩小圆角：
+当前整改要求所有最终圆弧都满足规格最低半径，且同一条管路的转弯半径一致。若相邻线段太短，
+正确处理是拒绝当前候选并回退到另一个半径或控制折线，而不是缩小单个圆角：
 
 ```text
-所需切向长度 = 规定弯曲半径 × tan(转向角 / 2)
+所需切向长度 = 候选弯曲半径 × tan(转向角 / 2)
 若前后直段不能同时容纳所需切向长度，则该转角不可行
 ```
 
-因此 JSON 中路线的 `bend_radius` 必须与该管路实际所有圆弧的 `segments[].radius` 一致；
-出现半径缩小、尖角折线或无法形成相切圆弧时，路线只能作为诊断结果。
+因此 JSON 中路线的 `requested_bend_radius` 是搜索参考值，`bend_radius` 是最终选定值；
+正式路线中所有圆弧的 `segments[].radius` 必须与 `bend_radius` 一致，且不小于规格
+`minimum_bend_radius`。出现半径缩小、尖角折线或无法形成相切圆弧时，路线只能作为诊断结果。
 
 **第二组：角度。** `ENGINEERING_MAX_BEND_ANGLE_DEG=90` 当前同时被传入两个位置：内部夹角最小值，以及单段圆弧最大分段角。它不是一个语义单一的“最大转弯角”开关。直线继续前进时内部夹角接近 180°，直角转弯内部夹角为 90°；内部夹角越小，回折越尖。
 
@@ -939,7 +942,7 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 | `engineered_path` | 直线和圆弧采样成的点列，用于显示及离散检查 |
 | `segments` | 真正交给 main4 的几何描述：`line` 含起终点；`arc` 另含圆心、实际半径和圆弧角 |
 | `tube_mesh` | 管体显示用三角网格，没有壁厚、材料或制造属性 |
-| 路线内 `requested_bend_radius`、`bend_radius` | 该管路规定的中心线弯曲半径；正式路线中所有圆弧的实际 `segments[].radius` 必须与之相同 |
+| 路线内 `requested_bend_radius`、`bend_radius` | 前者是规格推荐值提升后的搜索参考，后者是最终选定的统一中心线半径；正式路线中所有圆弧的 `segments[].radius` 必须与 `bend_radius` 相同且不小于规格最低值 |
 | `radius_reduced_count` | 正式路线必须为 `0`；若无法保持统一半径则路线失败并转为诊断 |
 | `arc_count`、`turn_count`、`main_turn_count` | 圆弧段数、生成圆角的转角数；当前 `main_turn_count` 与 `turn_count` 完全相同；一个转角可能拆成多段圆弧 |
 | `corner_angle_valid`、`corner_angle_violations` | 控制折线内部夹角检查及不满足项 |

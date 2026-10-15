@@ -31,7 +31,11 @@ HANGER_POINTS = []
 HANGER_POINT_DISTANCE_RANGE = 100.0
 
 # 空调管规格。金属管是连续芯管，胶管只在指定管段外包覆。
-# 弯曲半径的 minimum 值已经按 max(Excel 明确值, 1.5D) 整理；胶管使用 Excel 的固定值。
+# SAAA 表中的 R15、R20 等表示最低中心线弯曲半径，实际半径允许等于或大于该值。
+# minimum_bend_radius 是硬下限：金属管取 max(SAAA 最低值, 1.5D)，胶管取 SAAA 最低值。
+# recommended_bend_radius 仅提供搜索参考值，使用时会提升到至少 minimum_bend_radius；
+# 它不是最终固定值或上限。最终半径由直线余量、端点切向、挂点和净空共同确定，
+# 同一路线统一使用选中的实际半径，例如 metal_9 的最低 R15 可采用 R22。
 ACTIVE_PIPE_SPEC = "metal_19_05"
 PIPE_SPECS = {
     "metal_9": {
@@ -297,9 +301,10 @@ ENGINEERING_ARC_SAMPLE_ANGLE_DEG = 4.0
 ENGINEERING_SIMPLIFY_TOLERANCE = 25.0
 # Main3 主要布置转角数量上限，不包含起点和终点各自的必要切向过渡。
 ENGINEERING_MAX_TURN_COUNT = 10
-# 旧参数保留给历史 route JSON；空调管工程化阶段改用规格表中的 minimum_bend_radius。
+# 历史保留参数，当前主流程不使用；工程化硬下限来自 PIPE_SPECS.minimum_bend_radius。
 ENGINEERING_MIN_BEND_RADIUS = 25.0
-# Main3 自动缩小圆弧半径时每次递减的步长（mm）。
+# 普通路线从搜索参考半径向规格硬下限递减的候选步长（mm），不逐弯缩小实际圆弧。
+# 含大转角的路线使用下面的自适应步长，也可以选择大于参考值的统一半径。
 ENGINEERING_BEND_RADIUS_STEP = 10.0
 # 工程化阶段与规划阶段使用同一净空口径；当前额外安全带为 0 mm。
 ENGINEERING_VALIDATION_EXTRA_CLEARANCE = 0.0
@@ -309,7 +314,8 @@ ENGINEERING_MIN_SEGMENT_LENGTH = 40.0
 # 圆弧切入两侧仍保留的最小直线长度。旧的固定 45% 限制会误拒绝端部
 # 30 mm 切向锚点后的可制造 R15 圆弧，因此改为显式可审计的残余直线。
 ENGINEERING_FILLET_MIN_STRAIGHT_MM = 5.0
-# 含真实大转角的路线按该步长搜索可制造统一半径，最终上限由各角切线余量决定。
+# 含真实大转角的路线按该步长搜索可制造统一半径（mm）；最低值取规格硬下限，
+# 搜索上界由各角切线余量估算，可超过搜索参考值；候选仍须通过几何与净空验收。
 ENGINEERING_ADAPTIVE_BEND_RADIUS_STEP_MM = 1.0
 # 物理转角超过该值时视为需要圆弧处理的大弯，不再按补角阈值判为尖角；
 # 最终仍由统一弯曲半径、净空和端点连续性验收。
