@@ -272,7 +272,28 @@ def try_set_attr(obj, attr_name: str, value) -> bool:
         return False
 
 
-def create_circular_sweep(part, hybrid_body, center_curve, radius: float, route_name: str):
+def set_visual_color(obj, color: str | None) -> None:
+    """Best-effort CATIA display color; geometry remains the source of truth."""
+    if not color:
+        return
+    value = str(color).lstrip("#")
+    if len(value) != 6:
+        return
+    try:
+        rgb = tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
+        obj.VisProperties.SetRealColor(*rgb, 1)
+    except Exception:
+        pass
+
+
+def create_circular_sweep(
+    part,
+    hybrid_body,
+    center_curve,
+    radius: float,
+    route_name: str,
+    color: str | None = None,
+):
     factory = part.HybridShapeFactory
     center_ref = part.CreateReferenceFromObject(center_curve)
     sweep = factory.AddNewSweepCircle(center_ref)
@@ -287,6 +308,8 @@ def create_circular_sweep(part, hybrid_body, center_curve, radius: float, route_
     try_call(sweep, "SetRadius", 2, float(radius))
 
     try_set_name(sweep, f"{route_name}_circular_sweep_r{radius:g}")
+    set_visual_color(sweep, color)
+    set_visual_color(hybrid_body, color)
     return append_shape(part, hybrid_body, sweep)
 
 
@@ -398,32 +421,74 @@ def create_catia_part(route: dict, output: Path, radius: float, visible: bool, c
         f"[CATIA] route={route.get('name')} "
         f"segments={len(segments)} radius={radius:.2f}"
     )
-    segment_curves, point_cache = create_segment_curves(
-        factory,
-        part,
-        nodes_body,
-        curve_body,
-        route_name,
-        segments,
-    )
-    print(f"[CATIA] nodes={len(point_cache)}, curves={len(segment_curves)}")
+    components = route.get("component_segments") or []
+    if components:
+        # main3 clips the original line/arc geometry at exact cumulative
+        # distances, so the aluminium core is replaced by three separate
+        # sweeps instead of being left as an overlapping full-length tube.
+        total_nodes = 0
+        for component_index, component in enumerate(components, start=1):
+            component_segments = component.get("segments") or []
+            if not component_segments:
+                continue
+            component_kind = safe_name(component.get("kind", "component"))
+            component_body = hybrid_bodies.Add()
+            body_name = f"{route_name}_{component_kind}_{component_index:02d}"
+            try_set_name(component_body, body_name)
+            segment_curves, point_cache = create_segment_curves(
+                factory,
+                part,
+                nodes_body,
+                component_body,
+                body_name,
+                component_segments,
+            )
+            total_nodes += len(point_cache)
+            center_curve = create_join_centerline(factory, part, component_body, segment_curves)
+            try_set_name(center_curve, f"{body_name}_centerline")
+            if not centerline_only:
+                create_circular_sweep(
+                    part,
+                    component_body,
+                    center_curve,
+                    float(component.get("outer_radius", radius)),
+                    body_name,
+                    component.get("color"),
+                )
+            print(
+                f"[CATIA] component={component_kind} index={component_index} "
+                f"length={float(component.get('length_mm', 0.0)):.2f} mm "
+                f"radius={float(component.get('outer_radius', radius)):.2f}"
+            )
+        print(f"[CATIA] segmented nodes={total_nodes}, components={len(components)}")
+        part.Update()
+    else:
+        segment_curves, point_cache = create_segment_curves(
+            factory,
+            part,
+            nodes_body,
+            curve_body,
+            route_name,
+            segments,
+        )
+        print(f"[CATIA] nodes={len(point_cache)}, curves={len(segment_curves)}")
 
-    center_curve = create_join_centerline(factory, part, curve_body, segment_curves)
-    try_set_name(center_curve, f"{route_name}_line_arc_join")
-    print("[CATIA] center curve: joined line + arc segments")
+        center_curve = create_join_centerline(factory, part, curve_body, segment_curves)
+        try_set_name(center_curve, f"{route_name}_line_arc_join")
+        print("[CATIA] center curve: joined line + arc segments")
 
-    part.Update()
+        part.Update()
 
-    if not centerline_only:
-        try:
-            sweep = create_circular_sweep(part, curve_body, center_curve, radius, route_name)
-            part.Update()
-            print("[CATIA] circular sweep pipe created")
-        except Exception as exc:
-            raise RuntimeError(
-                f"CATIA circular sweep failed for formally valid route {route_name}; "
-                "the CATPart was not saved"
-            ) from exc
+        if not centerline_only:
+            try:
+                create_circular_sweep(part, curve_body, center_curve, radius, route_name)
+                part.Update()
+                print("[CATIA] circular sweep pipe created")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"CATIA circular sweep failed for formally valid route {route_name}; "
+                    "the CATPart was not saved"
+                ) from exc
 
     save_part_document(catia, part_doc, output)
 

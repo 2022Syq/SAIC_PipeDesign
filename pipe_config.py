@@ -160,6 +160,7 @@ class PipeInstance:
     allow_hard_conflicts: bool = False
     allow_inter_pipe_conflicts: bool = False
     allow_direct_guide_modeling: bool = False
+    pipe_segments: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipe_id, str) or not self.pipe_id.strip():
@@ -186,6 +187,17 @@ class PipeInstance:
             raise ValueError("allow_inter_pipe_conflicts must be a boolean")
         if not isinstance(self.allow_direct_guide_modeling, bool):
             raise ValueError("allow_direct_guide_modeling must be a boolean")
+        raw_segments = self.pipe_segments
+        if raw_segments is None:
+            raw_segments = ()
+        if isinstance(raw_segments, (str, bytes, Mapping)) or not isinstance(raw_segments, Sequence):
+            raise ValueError("pipe_segments must be an array")
+        normalized_segments = []
+        for index, segment in enumerate(raw_segments):
+            if not isinstance(segment, Mapping):
+                raise ValueError(f"pipe_segments[{index}] must be an object")
+            normalized_segments.append(dict(segment))
+        object.__setattr__(self, "pipe_segments", tuple(normalized_segments))
         if self.start == self.start_dir:
             raise ValueError("start_dir must differ from start")
         if self.goal == self.goal_dir:
@@ -193,7 +205,22 @@ class PipeInstance:
 
     @property
     def outer_radius(self) -> float:
-        return spec_outer_radius(self.pipe_spec)
+        radius = spec_outer_radius(self.pipe_spec)
+        # Planning must reserve the largest local envelope as well as the
+        # continuous metal core.  A sleeve is modelled as one millimetre of
+        # radial clearance around the configured hose unless overridden.
+        for segment in self.pipe_segments:
+            cover_spec = segment.get("cover_spec")
+            if not cover_spec:
+                continue
+            cover_radius = spec_outer_radius(str(cover_spec))
+            clearance = _number(
+                segment.get("sleeve_radial_clearance_mm", 1.0),
+                "pipe_segments.sleeve_radial_clearance_mm",
+                minimum=0.0,
+            )
+            radius = max(radius, cover_radius + clearance)
+        return radius
 
     @property
     def radius(self) -> float:
@@ -224,6 +251,7 @@ class PipeInstance:
             allow_hard_conflicts=value.get("allow_hard_conflicts", False),
             allow_inter_pipe_conflicts=value.get("allow_inter_pipe_conflicts", False),
             allow_direct_guide_modeling=value.get("allow_direct_guide_modeling", False),
+            pipe_segments=value.get("pipe_segments", ()),
         )
 
 
@@ -398,7 +426,8 @@ def merge_measured_points(config: RunConfig, measured: Mapping[str, Any] | str |
     """Merge ``main_point.py --multi-output`` coordinates into a run config.
 
     The measured file supplies only endpoint and direction coordinates. Pipe
-    specifications, priorities, and clearances remain owned by the run config.
+    specifications, priorities, clearances and local hose segments remain
+    owned by the run config.
     """
     if not isinstance(config, RunConfig):
         raise TypeError("config must be a RunConfig")

@@ -48,6 +48,28 @@ def test_required_guardians_are_named_and_keep_coordinates():
     assert pipe.required_hangers[0].point == (25.0, 1.0, 2.0)
 
 
+def test_pipe_segments_are_preserved_as_local_engineering_metadata():
+    pipe = PipeInstance.from_dict(
+        pipe_data(
+            pipe_id="PIPE_HOSE",
+            pipe_spec="metal_9",
+            pipe_segments=[{
+                "core_spec": "metal_9",
+                "cover_spec": "hose_8DE3",
+                "min_length_mm": 30.0,
+                "sleeve_length_mm": 30.0,
+            }],
+        )
+    )
+    assert pipe.pipe_segments[0]["cover_spec"] == "hose_8DE3"
+    assert pipe.outer_radius == 8.5
+
+
+def test_pipe_segments_must_be_objects():
+    with pytest.raises(ValueError, match="pipe_segments"):
+        PipeInstance.from_dict(pipe_data(pipe_segments=["hose_8DE3"]))
+
+
 def test_required_guardians_can_be_resolved_from_measured_points(tmp_path):
     config_path = tmp_path / "specs.json"
     config_path.write_text(

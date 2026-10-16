@@ -130,6 +130,23 @@ PIPE_SPECS = {
     },
 }
 
+# 胶管分段参数（单位：mm）。PIPE_SEGMENTS 为空时保持历史整根铝管行为。
+# min_length_mm 目前只允许工程师确认的 30 或 75；hose_length_mm 可在不低于
+# 该下限时调整。position_s_mm 是胶管中心沿整条中心线的弧长位置，省略时自动居中。
+HOSE_LENGTH_OPTIONS_MM = (30.0, 75.0)
+DEFAULT_HOSE_LENGTH_MM = 30.0
+DEFAULT_ALUMINUM_SLEEVE_LENGTH_MM = 30.0
+HOSE_POSITION_SEARCH_STEP_MM = 5.0
+HOSE_BEND_RADIUS_MODE = "warning"
+ENGINEERING_COMPONENT_COLORS = {
+    "aluminum": "#c7b79d",  # CATIA 中相近的浅铝色
+    "hose": "#b24f45",      # 红褐色胶管
+    "sleeve": "#c5a12a",    # 土黄色铝套
+}
+
+# 每个条目表示一个“铝套 + 胶管 + 铝套”局部替换段。
+# 例：{"core_spec":"metal_9", "cover_spec":"hose_8DE3",
+#      "min_length_mm":30.0, "sleeve_length_mm":30.0}
 # 工程师后续会把 CAD 中的起点、终点或管段编号填入这里；空表时使用 ACTIVE_PIPE_SPEC。
 PIPE_SEGMENTS = []
 

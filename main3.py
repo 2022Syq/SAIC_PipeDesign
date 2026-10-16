@@ -19,6 +19,7 @@ import numpy as np
 import settings
 from common_space import html_aspect_ratio, html_x_range, load_json, load_step_meshes_for_html, save_json
 from hanger_utils import hard_waypoint_report, hanger_distance_report, settings_hanger_points
+from hose_segments import COMPONENT_COLORS as DEFAULT_COMPONENT_COLORS, build_hose_layout
 from main2 import (
     DualSectionModel,
     hard_conflict_report,
@@ -29,6 +30,7 @@ from main2 import (
 
 
 ROUTE_COLORS = ["#ef2929", "#111827", "#2563eb", "#16a34a", "#f97316"]
+COMPONENT_COLORS = dict(getattr(settings, "ENGINEERING_COMPONENT_COLORS", DEFAULT_COMPONENT_COLORS))
 
 
 def norm(v):
@@ -210,11 +212,21 @@ def project_point_to_path(point, path: np.ndarray) -> tuple[float, float]:
     return best_s, best_d
 
 
-def validate_route_constraints(path: np.ndarray, engineered: dict, profile: dict, collision_model=None) -> dict:
+def validate_route_constraints(
+    path: np.ndarray,
+    engineered: dict,
+    profile: dict,
+    collision_model=None,
+    hose_layout: dict | None = None,
+) -> dict:
     """Check the confirmed air-conditioning constraints on one centerline."""
     path = np.asarray(path, dtype=float)
     hard_failures = []
     warnings = []
+
+    if hose_layout:
+        hard_failures.extend(hose_layout.get("hard_failures", []))
+        warnings.extend(hose_layout.get("warnings", []))
 
     arc_radii = [float(seg.get("radius", 0.0)) for seg in engineered.get("segments", []) if seg.get("type") == "arc"]
     minimum_radius = min(arc_radii) if arc_radii else None
@@ -357,6 +369,13 @@ def validate_route_constraints(path: np.ndarray, engineered: dict, profile: dict
         "minimum_actual_bend_angle_deg": min((bend["angle_deg"] for bend in bends), default=None),
         "aluminum_sleeve_axis_clearance_recommended": float(getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_RECOMMENDED", 80.0)),
         "aluminum_sleeve_axis_clearance_minimum": float(getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_MINIMUM", 65.0)),
+        "hose_layout": hose_layout or {
+            "enabled": False,
+            "valid": True,
+            "components": [],
+            "hard_failures": [],
+            "warnings": [],
+        },
     }
 
 
@@ -1364,6 +1383,130 @@ def tube_mesh(path: np.ndarray, radius: float, ring_count: int) -> dict:
     return {"x": xs, "y": ys, "z": zs, "i": ii, "j": jj, "k": kk}
 
 
+def engineered_segment_length(segment: dict) -> float:
+    """Return the centreline length of one line/arc engineering segment."""
+    if segment.get("type") == "line":
+        return dist(segment["start"], segment["end"])
+    if segment.get("type") == "arc":
+        return abs(math.radians(float(segment["angle_deg"]))) * float(segment["radius"])
+    raise ValueError(f"unsupported engineered segment type: {segment.get('type')}")
+
+
+def _arc_point(segment: dict, fraction: float) -> np.ndarray:
+    """Interpolate a point on an engineered arc without fitting a spline."""
+    fraction = min(max(float(fraction), 0.0), 1.0)
+    start = np.asarray(segment["start"], dtype=float)
+    end = np.asarray(segment["end"], dtype=float)
+    center = np.asarray(segment["center"], dtype=float)
+    radius = float(segment["radius"])
+    e1 = norm(start - center)
+    e2 = norm(end - center)
+    normal = norm(np.cross(e1, e2))
+    if float(np.linalg.norm(normal)) < 1e-9:
+        return start + fraction * (end - start)
+    tangent = norm(np.cross(normal, e1))
+    angle = math.radians(abs(float(segment["angle_deg"])))
+    point = center + radius * (math.cos(angle * fraction) * e1 + math.sin(angle * fraction) * tangent)
+    if fraction >= 1.0 - 1e-9:
+        return end
+    return point
+
+
+def _clip_engineered_segment(segment: dict, fraction_start: float, fraction_end: float) -> dict | None:
+    if fraction_end - fraction_start <= 1e-9:
+        return None
+    if segment.get("type") == "line":
+        a = np.asarray(segment["start"], dtype=float)
+        b = np.asarray(segment["end"], dtype=float)
+        start = a + (b - a) * float(fraction_start)
+        end = a + (b - a) * float(fraction_end)
+        return {"type": "line", "start": start.tolist(), "end": end.tolist()}
+    if segment.get("type") == "arc":
+        start = _arc_point(segment, fraction_start)
+        end = _arc_point(segment, fraction_end)
+        clipped = dict(segment)
+        clipped["start"] = start.tolist()
+        clipped["end"] = end.tolist()
+        clipped["angle_deg"] = float(segment["angle_deg"]) * (fraction_end - fraction_start)
+        return clipped
+    raise ValueError(f"unsupported engineered segment type: {segment.get('type')}")
+
+
+def clip_engineered_segments(segments: list[dict], start_s: float, end_s: float) -> list[dict]:
+    """Clip line/arc geometry to one cumulative centreline interval."""
+    if end_s <= start_s + 1e-7:
+        return []
+    clipped: list[dict] = []
+    current = 0.0
+    for segment in segments:
+        length = engineered_segment_length(segment)
+        overlap_start = max(float(start_s), current)
+        overlap_end = min(float(end_s), current + length)
+        if overlap_end - overlap_start > 1e-7 and length > 1e-9:
+            item = _clip_engineered_segment(
+                segment,
+                (overlap_start - current) / length,
+                (overlap_end - current) / length,
+            )
+            if item is not None:
+                clipped.append(item)
+        current += length
+        if current >= end_s - 1e-7:
+            break
+    return clipped
+
+
+def path_point_at_s(path: np.ndarray, distance_s: float) -> np.ndarray:
+    """Interpolate a sampled path point at cumulative distance ``distance_s``."""
+    points = np.asarray(path, dtype=float)
+    if len(points) == 0:
+        raise ValueError("cannot interpolate an empty path")
+    lengths = cumulative_lengths(points)
+    target = min(max(float(distance_s), 0.0), float(lengths[-1]))
+    index = int(np.searchsorted(lengths, target, side="right") - 1)
+    index = min(max(index, 0), len(points) - 2) if len(points) > 1 else 0
+    if len(points) == 1 or lengths[index + 1] <= lengths[index] + 1e-12:
+        return points[index].copy()
+    ratio = (target - lengths[index]) / (lengths[index + 1] - lengths[index])
+    return points[index] + ratio * (points[index + 1] - points[index])
+
+
+def sampled_path_slice(path: np.ndarray, start_s: float, end_s: float) -> np.ndarray:
+    """Return a sampled-path slice with exact boundary points."""
+    points = np.asarray(path, dtype=float)
+    lengths = cumulative_lengths(points)
+    start_s = min(max(float(start_s), 0.0), float(lengths[-1]))
+    end_s = min(max(float(end_s), start_s), float(lengths[-1]))
+    selected = [path_point_at_s(points, start_s)]
+    selected.extend(
+        point for point, value in zip(points[1:-1], lengths[1:-1])
+        if start_s + 1e-7 < value < end_s - 1e-7
+    )
+    selected.append(path_point_at_s(points, end_s))
+    result = remove_close_points(np.asarray(selected, dtype=float), 1e-7)
+    return result if len(result) >= 2 else np.vstack([result, result])
+
+
+def build_component_geometry(sampled: np.ndarray, engineered_segments: list[dict], layout: dict, ring_count: int) -> list[dict]:
+    """Create material-specific meshes and CATIA-ready clipped segments."""
+    result = []
+    total = float(cumulative_lengths(sampled)[-1]) if len(sampled) else 0.0
+    for component in layout.get("components", []):
+        start_s = max(0.0, min(float(component["start_s"]), total))
+        end_s = max(start_s, min(float(component["end_s"]), total))
+        local_path = sampled_path_slice(sampled, start_s, end_s)
+        kind = str(component["kind"])
+        result.append({
+            **component,
+            "start_s": start_s,
+            "end_s": end_s,
+            "color": COMPONENT_COLORS[kind],
+            "mesh": tube_mesh(local_path, float(component["outer_radius"]), ring_count),
+            "segments": clip_engineered_segments(engineered_segments, start_s, end_s),
+        })
+    return result
+
+
 def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     route_name = source_route.get("name", "route")
     guide = np.asarray(source_route["path"], dtype=float)
@@ -1516,6 +1659,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     engineered = None
     used_radius = None
     used_control = None
+    used_hose_layout = None
     radius_search = []
     radius_candidates = []
     for control_candidate in control_options:
@@ -1581,8 +1725,31 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                     route_start_dir - route_start,
                     route_goal_dir - route_goal,
                 )
+                hose_layout = build_hose_layout(
+                    path_length(candidate["sampled_path"]),
+                    constraint_profile.get("pipe_segments", []),
+                    getattr(settings, "PIPE_SPECS", {}),
+                    candidate["segments"],
+                    default_search_step_mm=float(
+                        getattr(settings, "HOSE_POSITION_SEARCH_STEP_MM", 5.0)
+                    ),
+                    default_bend_radius_mode=str(
+                        getattr(settings, "HOSE_BEND_RADIUS_MODE", "warning")
+                    ),
+                    default_hose_length_options_mm=tuple(
+                        getattr(settings, "HOSE_LENGTH_OPTIONS_MM", (30.0, 75.0))
+                    ),
+                    default_hose_length_mm=float(
+                        getattr(settings, "DEFAULT_HOSE_LENGTH_MM", 30.0)
+                    ),
+                    default_sleeve_length_mm=float(
+                        getattr(settings, "DEFAULT_ALUMINUM_SLEEVE_LENGTH_MM", 30.0)
+                    ),
+                )
                 constraint_report = validate_route_constraints(
-                    candidate["sampled_path"], candidate, constraint_profile, collision_model=collision_model,
+                    candidate["sampled_path"], candidate, constraint_profile,
+                    collision_model=collision_model,
+                    hose_layout=hose_layout,
                 )
                 if (candidate["corner_angle_valid"] and clearance_ok
                         and constraint_report["valid"] and geometry_report["valid"]
@@ -1590,6 +1757,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                     engineered = candidate
                     used_radius = radius
                     used_control = transition_control
+                    used_hose_layout = hose_layout
                     break
             if engineered is not None:
                 break
@@ -1606,7 +1774,34 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     control = used_control
     control_before_s_bend = used_control
     sampled = engineered["sampled_path"]
-    tube = tube_mesh(
+    if used_hose_layout is None:
+        used_hose_layout = build_hose_layout(
+            path_length(sampled),
+            constraint_profile.get("pipe_segments", []),
+            getattr(settings, "PIPE_SPECS", {}),
+            engineered["segments"],
+            default_search_step_mm=float(getattr(settings, "HOSE_POSITION_SEARCH_STEP_MM", 5.0)),
+            default_bend_radius_mode=str(getattr(settings, "HOSE_BEND_RADIUS_MODE", "warning")),
+            default_hose_length_options_mm=tuple(getattr(settings, "HOSE_LENGTH_OPTIONS_MM", (30.0, 75.0))),
+            default_hose_length_mm=float(getattr(settings, "DEFAULT_HOSE_LENGTH_MM", 30.0)),
+            default_sleeve_length_mm=float(getattr(settings, "DEFAULT_ALUMINUM_SLEEVE_LENGTH_MM", 30.0)),
+        )
+    component_geometry = build_component_geometry(
+        sampled,
+        engineered["segments"],
+        used_hose_layout if used_hose_layout.get("enabled") else {
+            "components": [{
+                "kind": "aluminum",
+                "spec_id": constraint_profile["core_spec"],
+                "start_s": 0.0,
+                "end_s": path_length(sampled),
+                "outer_radius": constraint_profile["core_outer_radius"],
+                "length_mm": path_length(sampled),
+            }]
+        },
+        params["tube_segments"],
+    )
+    tube = component_geometry[0]["mesh"] if len(component_geometry) == 1 else tube_mesh(
         sampled,
         float(params.get("pipe_radius", constraint_profile["envelope_radius"])),
         params["tube_segments"],
@@ -1630,7 +1825,8 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "pipe_id": params.get("pipe_id"),
         "start": route_start.tolist(),
         "goal": route_goal.tolist(),
-        "color": color,
+        "color": COMPONENT_COLORS["aluminum"],
+        "route_color": color,
         "bend_radius": float(used_radius),
         # 搜索参考值与最终值分别记录；实际圆弧半径以 bend_radius 为准。
         "requested_bend_radius": float(preferred_radius),
@@ -1679,6 +1875,16 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "corner_angle_violations": engineered["corner_angle_violations"],
         "protected_waypoint_geometry": engineered["protected_waypoint_geometry"],
         "constraint_report": constraint_report,
+        "hose_layout": used_hose_layout,
+        "component_meshes": component_geometry,
+        "component_segments": [
+            {
+                key: value
+                for key, value in component.items()
+                if key not in {"mesh"}
+            }
+            for component in component_geometry
+        ],
         "geometry_report": geometry_report,
         "collision_report": collision_report,
         "hard_conflicts": hard_conflicts["segments"],
@@ -1975,15 +2181,31 @@ for (const mesh of DATA.meshes) {
 }
 
 DATA.routes.forEach((route, routeIndex) => {
-  addRouteTrace(routeIndex, "pipe", {
-    type: "mesh3d",
-    name: `${route.name} pipe`,
-    x: route.tube_mesh.x, y: route.tube_mesh.y, z: route.tube_mesh.z,
-    i: route.tube_mesh.i, j: route.tube_mesh.j, k: route.tube_mesh.k,
-    color: route.color,
-    opacity: route.name.startsWith("01_") ? 0.72 : 0.42,
-    flatshading: false,
-  });
+  const components = route.component_meshes || [];
+  if (components.length) {
+    components.forEach((component, componentIndex) => {
+      addRouteTrace(routeIndex, componentIndex === 0 ? "pipe" : `component${componentIndex}`, {
+        type: "mesh3d",
+        name: `${route.name} ${component.kind}`,
+        x: component.mesh.x, y: component.mesh.y, z: component.mesh.z,
+        i: component.mesh.i, j: component.mesh.j, k: component.mesh.k,
+        color: component.color || route.color,
+        opacity: route.name.startsWith("01_") ? 0.72 : 0.42,
+        flatshading: false,
+        hovertemplate: `${route.name}<br>${component.kind}<br>length=${component.length_mm.toFixed(1)} mm<extra></extra>`,
+      });
+    });
+  } else {
+    addRouteTrace(routeIndex, "pipe", {
+      type: "mesh3d",
+      name: `${route.name} pipe`,
+      x: route.tube_mesh.x, y: route.tube_mesh.y, z: route.tube_mesh.z,
+      i: route.tube_mesh.i, j: route.tube_mesh.j, k: route.tube_mesh.k,
+      color: route.color,
+      opacity: route.name.startsWith("01_") ? 0.72 : 0.42,
+      flatshading: false,
+    });
+  }
 
   addRouteTrace(routeIndex, "centerline", {
     type: "scatter3d",
@@ -2143,6 +2365,11 @@ function applyRouteVisibility(routeIndex) {
   for (const [key] of SUBITEMS) {
     const traceIndex = routeTraceMap[routeIndex][key];
     Plotly.restyle("plot", { visible: enabled && subitemEnabled(routeIndex, key) }, [traceIndex]);
+  }
+  for (const [key, traceIndex] of Object.entries(routeTraceMap[routeIndex])) {
+    if (key.startsWith("component")) {
+      Plotly.restyle("plot", { visible: enabled && subitemEnabled(routeIndex, "pipe") }, [traceIndex]);
+    }
   }
   Plotly.restyle("distancePlot", { visible: enabled }, [routeIndex]);
   Plotly.restyle("seeThroughPlot", { visible: enabled }, [routeIndex]);

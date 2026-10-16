@@ -101,9 +101,41 @@ match the selected radius. The reference value need not match the result.
 
 The planning envelope uses the largest selected outside radius. The current
 active value is `metal_19_05`, so `PIPE_DIAMETER=19.05` mm and
-`PIPE_RADIUS=9.525` mm. Hose rows remain available as specification metadata;
-the current engineering flow requires a continuous metal core and only applies
-hose or sleeve data to configured `PIPE_SEGMENTS`.
+`PIPE_RADIUS=9.525` mm. A route with local hose segments reserves the largest
+local hose/sleeve envelope as well as the metal core.
+
+## Local hose and aluminium sleeves
+
+`settings.PIPE_SEGMENTS` (or a per-pipe `pipe_segments` array in a multi-pipe
+JSON file) describes a local replacement of the metal tube:
+
+```json
+{
+  "core_spec": "metal_9",
+  "cover_spec": "hose_8DE3",
+  "min_length_mm": 30.0,
+  "hose_length_mm": 30.0,
+  "sleeve_length_mm": 30.0,
+  "bend_radius_mode": "warning"
+}
+```
+
+`metal_9` is 9 mm outside diameter and maps to `hose_8DE3` at 15 mm outside
+diameter with SAAA minimum bend radius R50. `min_length_mm` is currently 30 or
+75 mm; the actual hose length must be at least that value. Each end has one
+30 mm aluminium sleeve by default, so the occupied centreline span is
+`hose_length_mm + 2 * sleeve_length_mm`. With no explicit position the span is
+placed at the route centre. `position_s_mm` or `position_ratio` can provide a
+manual hose centre later.
+
+The layout first searches for a centre-position span whose hose portion stays
+on bends at or above the hose minimum radius. `bend_radius_mode="hard"` rejects
+the route when no such position exists; the default `warning` mode keeps the
+route and records the R50 violation in `hose_layout` and the HTML metadata.
+Engineering HTML uses CATIA-like colours: light aluminium, red-brown hose and
+ochre sleeves. CATPart export creates separate sweeps for these intervals when
+`component_segments` are present; an empty `PIPE_SEGMENTS` keeps the historical
+single aluminium sweep.
 
 ## Multi-pipe run
 
