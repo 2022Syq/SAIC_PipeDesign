@@ -115,8 +115,7 @@ JSON file) describes a local replacement of the metal tube:
   "cover_spec": "hose_8DE3",
   "min_length_mm": 30.0,
   "hose_length_mm": 30.0,
-  "sleeve_length_mm": 30.0,
-  "bend_radius_mode": "warning"
+  "sleeve_length_mm": 30.0
 }
 ```
 
@@ -127,12 +126,14 @@ diameter with SAAA minimum bend radius R50. `min_length_mm` is currently 30 or
 hose, so the occupied centreline span is
 `hose_length_mm + 2 * sleeve_length_mm`. With no explicit position the span is
 placed at the route centre. `position_s_mm` or `position_ratio` can provide a
-manual hose centre later.
+manual hose centre later. The hose and sleeves follow the already planned route
+geometry; no new arc is fitted from the hose endpoints. The R50 value is
+checked against that existing geometry for a warning only, so a route is still
+generated when the warning is present.
 
-The layout first searches for a centre-position span whose hose portion stays
-on bends at or above the hose minimum radius. `bend_radius_mode="hard"` rejects
-the route when no such position exists; the default `warning` mode keeps the
-route and records the R50 violation in `hose_layout` and the HTML metadata.
+If `hose_length_mm + 2 * sleeve_length_mm` is longer than the route, the local
+layout is disabled and the route is exported as one full aluminium tube. The
+fallback and its reason are recorded in `hose_layout`.
 Engineering HTML uses CATIA-like colours: light aluminium, red-brown hose and
 ochre sleeves. CATPart export creates separate sweeps for these intervals when
 `component_segments` are present; an empty `PIPE_SEGMENTS` keeps the historical

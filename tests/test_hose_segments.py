@@ -58,8 +58,10 @@ class HoseSegmentTests(unittest.TestCase):
         self.assertAlmostEqual(hose["start_s"], 140.0)
         self.assertAlmostEqual(hose["end_s"], 220.0)
         self.assertEqual(hose["position_mode"], "manual_s")
+        self.assertAlmostEqual(layout["position_s_mm"], 180.0)
+        self.assertAlmostEqual(layout["position_ratio"], 0.6)
 
-    def test_hose_bend_radius_is_warning_or_hard_failure_by_mode(self):
+    def test_hose_bend_radius_is_warning_only(self):
         better_arc = {
             "type": "arc", "center": [0.0, 0.0, 0.0], "radius": 49.0,
             "angle_deg": 90.0, "start": [49.0, 0.0, 0.0], "end": [0.0, 49.0, 0.0],
@@ -74,16 +76,16 @@ class HoseSegmentTests(unittest.TestCase):
         )
         self.assertTrue(warning["valid"])
         warning_item = next(item for item in warning["warnings"] if item["rule"] == "hose_bend_radius")
-        self.assertTrue(warning_item["best_effort"])
-        self.assertAlmostEqual(warning_item["minimum_actual_radius_mm"], 49.0)
+        self.assertEqual(warning_item["action"], "generate_anyway")
+        self.assertAlmostEqual(warning_item["minimum_actual_radius_mm"], 40.0)
         hard = build_hose_layout(
             139.800,
-            [{"core_spec": "metal_9", "cover_spec": "hose_8DE3", "bend_radius_mode": "hard"}],
+            [{"core_spec": "metal_9", "cover_spec": "hose_8DE3"}],
             SPECS,
             segments,
         )
-        self.assertFalse(hard["valid"])
-        self.assertIn("hose_bend_radius", {item["rule"] for item in hard["hard_failures"]})
+        self.assertTrue(hard["valid"])
+        self.assertIn("hose_bend_radius", {item["rule"] for item in hard["warnings"]})
 
         manual = build_hose_layout(
             139.800,
@@ -94,6 +96,20 @@ class HoseSegmentTests(unittest.TestCase):
         hose = next(item for item in manual["components"] if item["kind"] == "hose")
         self.assertAlmostEqual((hose["start_s"] + hose["end_s"]) / 2.0, 62.831853)
         self.assertTrue(any(item["rule"] == "hose_bend_radius" for item in manual["warnings"]))
+
+    def test_total_span_over_route_falls_back_to_full_aluminum(self):
+        layout = build_hose_layout(
+            89.0,
+            [{"core_spec": "metal_9", "cover_spec": "hose_8DE3"}],
+            SPECS,
+        )
+        self.assertTrue(layout["valid"])
+        self.assertFalse(layout["enabled"])
+        self.assertEqual(layout["fallback"], "all_aluminum")
+        self.assertEqual(layout["fallback_reason"], "hose_total_span")
+        warning = next(item for item in layout["warnings"] if item["rule"] == "hose_total_span")
+        self.assertEqual(warning["action"], "fallback_to_full_aluminum")
+        self.assertEqual(layout["components"], [])
 
     def test_mapping_and_minimums_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "must use hose_8DE3"):

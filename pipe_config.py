@@ -207,8 +207,8 @@ class PipeInstance:
     def outer_radius(self) -> float:
         radius = spec_outer_radius(self.pipe_spec)
         # Planning must reserve the largest local envelope as well as the
-        # continuous metal core.  A sleeve is modelled as one millimetre of
-        # radial clearance around the configured hose unless overridden.
+        # continuous metal core.  A sleeve uses the configured hose radius;
+        # an explicit radial clearance can enlarge that envelope.
         for segment in self.pipe_segments:
             cover_spec = segment.get("cover_spec")
             if not cover_spec:

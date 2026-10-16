@@ -60,9 +60,9 @@ def cumulative_lengths(path: np.ndarray) -> np.ndarray:
 def active_constraint_profile(spec_id: str | None = None, envelope_radius: float | None = None, pipe_segments=None) -> dict:
     """Resolve the selected air-conditioning pipe rules for this run.
 
-    The planning space still uses one conservative route envelope.  Segment
-    assignments are carried in the output for the engineer's next test; until
-    coordinates are supplied, engineering uses the active/default core spec.
+    The planning space still uses one conservative route envelope. Segment
+    assignments are applied along the generated route and use the active
+    metal core until a different core is explicitly configured.
     """
     spec_id = str(spec_id or getattr(settings, "ACTIVE_PIPE_SPEC", ""))
     specs = getattr(settings, "PIPE_SPECS", {})
@@ -83,8 +83,8 @@ def active_constraint_profile(spec_id: str | None = None, envelope_radius: float
         if unknown:
             raise ValueError(f"Unknown pipe specs: {sorted(unknown)}")
         spec_ids = sorted(spec_ids)
-    # 当前运行按一个主动金属规格工程化；胶管规格先保留在分段元数据中，
-    # 等工程师提供区间后再对局部中心线应用胶管半径。
+    # 当前运行按一个主动金属规格工程化；局部胶管规格由 hose_layout
+    # 应用到对应的中心线区间，规划包络同时保留最大局部外径。
     # SAAA 半径是最低要求。recommended 仅作搜索参考，并提升到硬下限；
     # preferred 不限制最终半径上限，大转角搜索可以选用更大的统一半径。
     preferred = max(
@@ -1730,12 +1730,6 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                     constraint_profile.get("pipe_segments", []),
                     getattr(settings, "PIPE_SPECS", {}),
                     candidate["segments"],
-                    default_search_step_mm=float(
-                        getattr(settings, "HOSE_POSITION_SEARCH_STEP_MM", 5.0)
-                    ),
-                    default_bend_radius_mode=str(
-                        getattr(settings, "HOSE_BEND_RADIUS_MODE", "warning")
-                    ),
                     default_hose_length_options_mm=tuple(
                         getattr(settings, "HOSE_LENGTH_OPTIONS_MM", (30.0, 75.0))
                     ),
@@ -1783,8 +1777,6 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
             constraint_profile.get("pipe_segments", []),
             getattr(settings, "PIPE_SPECS", {}),
             engineered["segments"],
-            default_search_step_mm=float(getattr(settings, "HOSE_POSITION_SEARCH_STEP_MM", 5.0)),
-            default_bend_radius_mode=str(getattr(settings, "HOSE_BEND_RADIUS_MODE", "warning")),
             default_hose_length_options_mm=tuple(getattr(settings, "HOSE_LENGTH_OPTIONS_MM", (30.0, 75.0))),
             default_hose_length_mm=float(getattr(settings, "DEFAULT_HOSE_LENGTH_MM", 30.0)),
             default_sleeve_length_mm=float(getattr(settings, "DEFAULT_ALUMINUM_SLEEVE_LENGTH_MM", 30.0)),
@@ -2394,9 +2386,12 @@ function buildRouteControls() {
     const hoseLayout = route.hose_layout || {};
     const hoseWarnings = hoseLayout.warnings || [];
     const hoseRadiusWarning = hoseWarnings.find(item => item.rule === "hose_bend_radius");
-    const hoseInfo = hoseRadiusWarning
-      ? `Hose bend warning: best position ${Number(hoseRadiusWarning.position_s_mm).toFixed(1)} mm, actual R${Number(hoseRadiusWarning.minimum_actual_radius_mm || 0).toFixed(1)} / required R${Number(hoseRadiusWarning.minimum_mm).toFixed(1)}`
-      : (hoseLayout.enabled ? "Hose layout: R50 OK" : "Hose: none");
+    const spanWarning = hoseWarnings.find(item => item.rule === "hose_total_span");
+    const hoseInfo = hoseLayout.fallback === "all_aluminum"
+      ? `Hose fallback: full aluminum (${Number(spanWarning && spanWarning.required_mm || 0).toFixed(1)} / ${Number(spanWarning && spanWarning.available_mm || 0).toFixed(1)} mm)`
+      : hoseRadiusWarning
+        ? `Hose bend warning: center ${Number(hoseRadiusWarning.position_s_mm).toFixed(1)} mm, actual R${Number(hoseRadiusWarning.minimum_actual_radius_mm || 0).toFixed(1)} / required R${Number(hoseRadiusWarning.minimum_mm).toFixed(1)}`
+        : (hoseLayout.enabled ? "Hose layout: R50 OK" : "Hose: none");
     main.innerHTML = `
       <input id="route-main-${routeIndex}" type="checkbox" checked>
       <span class="swatch" style="background:${route.color}"></span>
