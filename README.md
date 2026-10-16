@@ -123,7 +123,8 @@ JSON file) describes a local replacement of the metal tube:
 `metal_9` is 9 mm outside diameter and maps to `hose_8DE3` at 15 mm outside
 diameter with SAAA minimum bend radius R50. `min_length_mm` is currently 30 or
 75 mm; the actual hose length must be at least that value. Each end has one
-30 mm aluminium sleeve by default, so the occupied centreline span is
+30 mm aluminium sleeve by default, with the same 15 mm outside diameter as the
+hose, so the occupied centreline span is
 `hose_length_mm + 2 * sleeve_length_mm`. With no explicit position the span is
 placed at the route centre. `position_s_mm` or `position_ratio` can provide a
 manual hose centre later.

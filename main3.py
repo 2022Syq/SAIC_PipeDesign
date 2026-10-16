@@ -1745,6 +1745,9 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                     default_sleeve_length_mm=float(
                         getattr(settings, "DEFAULT_ALUMINUM_SLEEVE_LENGTH_MM", 30.0)
                     ),
+                    default_sleeve_radial_clearance_mm=float(
+                        getattr(settings, "DEFAULT_SLEEVE_RADIAL_CLEARANCE_MM", 0.0)
+                    ),
                 )
                 constraint_report = validate_route_constraints(
                     candidate["sampled_path"], candidate, constraint_profile,
@@ -1785,6 +1788,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
             default_hose_length_options_mm=tuple(getattr(settings, "HOSE_LENGTH_OPTIONS_MM", (30.0, 75.0))),
             default_hose_length_mm=float(getattr(settings, "DEFAULT_HOSE_LENGTH_MM", 30.0)),
             default_sleeve_length_mm=float(getattr(settings, "DEFAULT_ALUMINUM_SLEEVE_LENGTH_MM", 30.0)),
+            default_sleeve_radial_clearance_mm=float(getattr(settings, "DEFAULT_SLEEVE_RADIAL_CLEARANCE_MM", 0.0)),
         )
     component_geometry = build_component_geometry(
         sampled,
@@ -2387,6 +2391,12 @@ function buildRouteControls() {
     const hangerInfo = hanger.count
       ? `Hanger ${route.hanger_valid ? "OK" : "NG"} ${hanger.satisfied_count}/${hanger.count}, max ${hanger.max_distance.toFixed(1)} mm / ${hanger.range.toFixed(1)} mm`
       : "Hanger: none";
+    const hoseLayout = route.hose_layout || {};
+    const hoseWarnings = hoseLayout.warnings || [];
+    const hoseRadiusWarning = hoseWarnings.find(item => item.rule === "hose_bend_radius");
+    const hoseInfo = hoseRadiusWarning
+      ? `Hose bend warning: best position ${Number(hoseRadiusWarning.position_s_mm).toFixed(1)} mm, actual R${Number(hoseRadiusWarning.minimum_actual_radius_mm || 0).toFixed(1)} / required R${Number(hoseRadiusWarning.minimum_mm).toFixed(1)}`
+      : (hoseLayout.enabled ? "Hose layout: R50 OK" : "Hose: none");
     main.innerHTML = `
       <input id="route-main-${routeIndex}" type="checkbox" checked>
       <span class="swatch" style="background:${route.color}"></span>
@@ -2397,6 +2407,10 @@ function buildRouteControls() {
     hangerDiv.className = "subItem";
     hangerDiv.textContent = hangerInfo;
     block.appendChild(hangerDiv);
+    const hoseDiv = document.createElement("div");
+    hoseDiv.className = "subItem";
+    hoseDiv.textContent = hoseInfo;
+    block.appendChild(hoseDiv);
 
     const details = document.createElement("details");
     details.innerHTML = `<summary>Subitems</summary><div class="subItems"></div>`;

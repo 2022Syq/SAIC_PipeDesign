@@ -68,11 +68,29 @@ def arc_radius_intervals(engineered_segments: Sequence[Mapping[str, Any]]) -> li
     return result
 
 
-def _hose_radius_is_valid(start_s: float, end_s: float, arcs: Sequence[tuple[float, float, float]], minimum: float) -> bool:
+def _hose_radius_score(
+    start_s: float,
+    end_s: float,
+    arcs: Sequence[tuple[float, float, float]],
+    minimum: float,
+) -> tuple[float, float, float, list[float]]:
+    """Score one hose interval by its weakest bend and weighted deficit."""
+    overlaps: list[tuple[float, float]] = []
     for arc_start, arc_end, radius in arcs:
-        if min(end_s, arc_end) - max(start_s, arc_start) > 1e-7 and radius + 1e-6 < minimum:
-            return False
-    return True
+        overlap = min(end_s, arc_end) - max(start_s, arc_start)
+        if overlap > 1e-7:
+            overlaps.append((overlap, radius))
+    if not overlaps:
+        return float("inf"), 0.0, 0.0, []
+    minimum_actual = min(radius for _overlap, radius in overlaps)
+    deficit = sum(overlap * max(0.0, minimum - radius) for overlap, radius in overlaps)
+    overlap_length = sum(overlap for overlap, _radius in overlaps)
+    return minimum_actual, deficit, overlap_length, [radius for _overlap, radius in overlaps]
+
+
+def _hose_radius_is_valid(start_s: float, end_s: float, arcs: Sequence[tuple[float, float, float]], minimum: float) -> bool:
+    minimum_actual, _deficit, _overlap_length, _radii = _hose_radius_score(start_s, end_s, arcs, minimum)
+    return minimum_actual + 1e-6 >= minimum
 
 
 def _candidate_centres(
@@ -111,6 +129,7 @@ def build_hose_layout(
     default_hose_length_options_mm: Sequence[float] = DEFAULT_HOSE_LENGTH_OPTIONS_MM,
     default_hose_length_mm: float = DEFAULT_HOSE_LENGTH_MM,
     default_sleeve_length_mm: float = DEFAULT_SLEEVE_LENGTH_MM,
+    default_sleeve_radial_clearance_mm: float = 0.0,
 ) -> dict[str, Any]:
     """Resolve optional hose/sleeve intervals and their constraint report.
 
@@ -212,12 +231,33 @@ def build_hose_layout(
         )
         if manual_position:
             mode = "warning"
+        valid_candidate = None
         for candidate in candidates:
             hose_start = candidate - hose_half
             hose_end = candidate + hose_half
             if _hose_radius_is_valid(hose_start, hose_end, arcs, minimum_radius):
-                chosen_center = candidate
+                valid_candidate = candidate
                 break
+        if valid_candidate is not None:
+            chosen_center = valid_candidate
+        else:
+            # No R50-safe interval exists. Choose the best available interval
+            # by minimum weighted radius deficit, then by weakest radius, then
+            # by distance to the requested centre. Keep it as a warning in the
+            # default mode so the engineer can still inspect the route.
+            def candidate_key(candidate: float):
+                actual, deficit, overlap_length, _radii = _hose_radius_score(
+                    candidate - hose_half, candidate + hose_half, arcs, minimum_radius
+                )
+                return (
+                    -deficit,
+                    actual,
+                    -overlap_length,
+                    -abs(candidate - preferred_center),
+                )
+
+            if candidates:
+                chosen_center = max(candidates, key=candidate_key)
         hose_start = chosen_center - hose_half
         hose_end = chosen_center + hose_half
         total_start = chosen_center - half_span
@@ -232,12 +272,19 @@ def build_hose_layout(
                 "selected_center_s_mm": chosen_center,
             })
         if not radius_valid:
+            actual_minimum, deficit, overlap_length, actual_radii = _hose_radius_score(
+                hose_start, hose_end, arcs, minimum_radius
+            )
             violation = {
                 "rule": "hose_bend_radius",
                 "index": index,
-                "actual_radii_mm": [radius for start, end, radius in arcs if min(hose_end, end) - max(hose_start, start) > 1e-7],
+                "actual_radii_mm": actual_radii,
+                "minimum_actual_radius_mm": actual_minimum,
                 "minimum_mm": minimum_radius,
                 "position_s_mm": chosen_center,
+                "weighted_deficit_mm2": deficit,
+                "overlap_length_mm": overlap_length,
+                "best_effort": True,
             }
             if mode == "hard":
                 hard_failures.append(violation)
@@ -249,7 +296,7 @@ def build_hose_layout(
         occupied.append((total_start, total_end))
 
         sleeve_radius = float(hose.get("outer_diameter", 0.0)) / 2.0 + _number(
-            raw.get("sleeve_radial_clearance_mm", 1.0),
+            raw.get("sleeve_radial_clearance_mm", default_sleeve_radial_clearance_mm),
             f"PIPE_SEGMENTS[{index}].sleeve_radial_clearance_mm",
             minimum=0.0,
         )

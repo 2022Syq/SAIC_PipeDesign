@@ -41,6 +41,7 @@ class HoseSegmentTests(unittest.TestCase):
         self.assertEqual(hose["length_mm"], 30.0)
         self.assertAlmostEqual(hose["start_s"], 135.0)
         self.assertAlmostEqual(hose["end_s"], 165.0)
+        self.assertTrue(all(item["outer_radius"] == 7.5 for item in layout["components"] if item["kind"] == "sleeve"))
 
     def test_75_mm_option_and_manual_position_are_preserved(self):
         layout = build_hose_layout(
@@ -59,18 +60,24 @@ class HoseSegmentTests(unittest.TestCase):
         self.assertEqual(hose["position_mode"], "manual_s")
 
     def test_hose_bend_radius_is_warning_or_hard_failure_by_mode(self):
-        arc = {
-            "type": "arc", "center": [0.0, 0.0, 0.0], "radius": 40.0,
-            "angle_deg": 180.0, "start": [40.0, 0.0, 0.0], "end": [-40.0, 0.0, 0.0],
+        better_arc = {
+            "type": "arc", "center": [0.0, 0.0, 0.0], "radius": 49.0,
+            "angle_deg": 90.0, "start": [49.0, 0.0, 0.0], "end": [0.0, 49.0, 0.0],
         }
-        segments = [arc]
+        segments = [
+            {"type": "arc", "center": [0.0, 0.0, 0.0], "radius": 40.0,
+             "angle_deg": 90.0, "start": [40.0, 0.0, 0.0], "end": [0.0, 40.0, 0.0]},
+            better_arc,
+        ]
         warning = build_hose_layout(
-            125.663706, [{"core_spec": "metal_9", "cover_spec": "hose_8DE3"}], SPECS, segments,
+            139.800, [{"core_spec": "metal_9", "cover_spec": "hose_8DE3"}], SPECS, segments,
         )
         self.assertTrue(warning["valid"])
-        self.assertTrue(any(item["rule"] == "hose_bend_radius" for item in warning["warnings"]))
+        warning_item = next(item for item in warning["warnings"] if item["rule"] == "hose_bend_radius")
+        self.assertTrue(warning_item["best_effort"])
+        self.assertAlmostEqual(warning_item["minimum_actual_radius_mm"], 49.0)
         hard = build_hose_layout(
-            125.663706,
+            139.800,
             [{"core_spec": "metal_9", "cover_spec": "hose_8DE3", "bend_radius_mode": "hard"}],
             SPECS,
             segments,
@@ -79,7 +86,7 @@ class HoseSegmentTests(unittest.TestCase):
         self.assertIn("hose_bend_radius", {item["rule"] for item in hard["hard_failures"]})
 
         manual = build_hose_layout(
-            125.663706,
+            139.800,
             [{"core_spec": "metal_9", "cover_spec": "hose_8DE3", "position_s_mm": 62.831853}],
             SPECS,
             segments,

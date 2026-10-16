@@ -12,7 +12,7 @@
 
 - `metal_9` 是 9 mm 铝管；`hose_8DE3` 是对应的 15 mm 胶管，SAAA 最小弯曲半径为 R50。
 - `min_length_mm` 当前取 30 或 75，`hose_length_mm` 不低于该值。
-- `sleeve_length_mm` 是每一端铝套的长度，默认 30 mm（3 cm）；它是正值参数，不把“约 3 cm”误写成不可调整的工艺下限。
+- `sleeve_length_mm` 是每一端铝套的长度，默认 30 mm（3 cm）；铝套外径默认与 15 mm 胶管相同。它是正值参数，不把“约 3 cm”误写成不可调整的工艺下限。
 - 没有 `position_s_mm`/`position_ratio` 时，按整条中心线中部放置总跨度；自动模式会寻找 R50 可行位置。
 - 显式位置保持不变，弯曲半径只记录 warning；`bend_radius_mode="hard"` 仅用于自动位置的硬约束。
 

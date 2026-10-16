@@ -62,7 +62,7 @@ def test_pipe_segments_are_preserved_as_local_engineering_metadata():
         )
     )
     assert pipe.pipe_segments[0]["cover_spec"] == "hose_8DE3"
-    assert pipe.outer_radius == 8.5
+    assert pipe.outer_radius == 7.5
 
 
 def test_pipe_segments_must_be_objects():

@@ -215,7 +215,10 @@ class PipeInstance:
                 continue
             cover_radius = spec_outer_radius(str(cover_spec))
             clearance = _number(
-                segment.get("sleeve_radial_clearance_mm", 1.0),
+                segment.get(
+                    "sleeve_radial_clearance_mm",
+                    getattr(settings, "DEFAULT_SLEEVE_RADIAL_CLEARANCE_MM", 0.0),
+                ),
                 "pipe_segments.sleeve_radial_clearance_mm",
                 minimum=0.0,
             )
