@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import math
 import re
 import sys
@@ -33,6 +34,11 @@ DEFAULT_NAMES = {
 }
 
 HANGER_POINT_NAMES = ["GUADIAN"] + [f"GUADIAN{i}" for i in range(1, 11)]
+MULTI_POINT_PATTERN = re.compile(
+    r"^(?P<pipe_id>.+)_(?P<kind>START|GOAL|START_DIR(?:_POINT)?|GOAL_DIR(?:_POINT)?)$",
+    re.IGNORECASE,
+)
+GUARDIAN_POINT_PATTERN = re.compile(r"^GUADIAN_[^#]+#\d+$", re.IGNORECASE)
 
 
 def coordinate_key(point: list[float], tolerance: float = 1e-5) -> tuple[int, int, int]:
@@ -155,6 +161,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(settings.PROJECT_DIR) / "settings.py",
         help="settings.py path used with --write-settings.",
+    )
+    parser.add_argument(
+        "--multi-output",
+        type=Path,
+        help="Measure prefixed route points in the selected container and write a JSON file without changing settings.py.",
+    )
+    parser.add_argument(
+        "--multi-body",
+        action="append",
+        dest="multi_bodies",
+        help="HybridBody to include in --multi-output; repeat once for each route container.",
     )
     parser.set_defaults(write_settings=True)
     return parser.parse_args()
@@ -574,6 +591,118 @@ def measure_point(part, spa_workbench, point_shape) -> list[float]:
     return [float(coords[0]), float(coords[1]), float(coords[2])]
 
 
+def discover_multi_route_point_names(hybrid_body) -> dict[str, dict[str, str]]:
+    """Discover prefixed route points directly contained in one CATIA set."""
+    shapes = get_hybrid_shapes(hybrid_body)
+    if shapes is None:
+        raise KeyError(f'HybridBody "{item_name(hybrid_body)}" has no HybridShapes.')
+    discovered: dict[str, dict[str, str]] = {}
+    suffix_map = {
+        "start": "start",
+        "goal": "goal",
+        "start_dir": "start_dir",
+        "start_dir_point": "start_dir",
+        "goal_dir": "goal_dir",
+        "goal_dir_point": "goal_dir",
+    }
+    for index in range(1, collection_count(shapes) + 1):
+        shape = collection_item(shapes, index)
+        if shape is None:
+            continue
+        actual_name = item_name(shape)
+        match = MULTI_POINT_PATTERN.match(actual_name)
+        if match is None:
+            continue
+        pipe_id = match.group("pipe_id").strip()
+        kind = suffix_map[match.group("kind").casefold()]
+        if not pipe_id:
+            continue
+        existing = discovered.setdefault(pipe_id, {})
+        if kind in existing and existing[kind] != actual_name:
+            raise ValueError(f"Multiple {kind} points found for {pipe_id}: {existing[kind]}, {actual_name}")
+        existing[kind] = actual_name
+    required = {"start", "goal", "start_dir", "goal_dir"}
+    incomplete = {
+        pipe_id: sorted(required.difference(points))
+        for pipe_id, points in discovered.items()
+        if required.difference(points)
+    }
+    if incomplete:
+        details = "; ".join(f"{pipe_id}: {', '.join(missing)}" for pipe_id, missing in incomplete.items())
+        raise ValueError(f"Each multi-pipe prefix needs START, GOAL, START_DIR and GOAL_DIR: {details}")
+    if not discovered:
+        raise KeyError("No prefixed route points found; expected names such as PIPE_01_START")
+    return dict(sorted(discovered.items()))
+
+
+def measure_multi_route_points(part, spa_workbench, hybrid_body) -> list[dict]:
+    """Measure complete prefixed route point groups in one or more CATIA sets."""
+    bodies = list(hybrid_body) if isinstance(hybrid_body, (list, tuple)) else [hybrid_body]
+    measured = []
+    seen_pipe_ids = set()
+    for body in bodies:
+        groups = discover_multi_route_point_names(body)
+        shapes = get_hybrid_shapes(body)
+        for pipe_id, names in groups.items():
+            if pipe_id in seen_pipe_ids:
+                raise ValueError(f"Duplicate multi-pipe point group across containers: {pipe_id}")
+            points = {
+                kind: measure_point(
+                    part,
+                    spa_workbench,
+                    get_item_by_name(shapes, point_name),
+                )
+                for kind, point_name in names.items()
+            }
+            measured.append({"pipe_id": pipe_id, **points, "point_names": names})
+            seen_pipe_ids.add(pipe_id)
+    return sorted(measured, key=lambda item: str(item["pipe_id"]))
+
+
+def measure_named_guardian_points(part, spa_workbench, hybrid_body) -> list[dict]:
+    """Measure explicitly named multi-pipe guardian points in one or more sets."""
+    bodies = list(hybrid_body) if isinstance(hybrid_body, (list, tuple)) else [hybrid_body]
+    measured = []
+    seen_names = set()
+    for body in bodies:
+        for item in _measure_named_guardian_points_in_body(part, spa_workbench, body):
+            if item["name"] in seen_names:
+                raise ValueError(f"Duplicate measured guardian across containers: {item['name']}")
+            measured.append(item)
+            seen_names.add(item["name"])
+    return measured
+
+
+def _measure_named_guardian_points_in_body(part, spa_workbench, hybrid_body) -> list[dict]:
+    """Measure named guardian points from one CATIA HybridBody."""
+    shapes = get_hybrid_shapes(hybrid_body)
+    if shapes is None:
+        raise KeyError(f'HybridBody "{item_name(hybrid_body)}" has no HybridShapes.')
+    measured = []
+    for index in range(1, collection_count(shapes) + 1):
+        shape = collection_item(shapes, index)
+        if shape is None:
+            continue
+        name = item_name(shape)
+        if GUARDIAN_POINT_PATTERN.fullmatch(name) is None:
+            continue
+        measured.append({"name": name, "point": measure_point(part, spa_workbench, shape)})
+    return measured
+
+
+def write_multi_route_points(
+    path: Path,
+    body: str | list[str],
+    measured: list[dict],
+    guardians: list[dict] | None = None,
+) -> None:
+    """Write measured coordinates for later merge with pipe specifications."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"body": body, "pipes": measured, "guardians": guardians or []}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def format_float(value: float) -> str:
     value = float(value)
     if abs(value) < 1e-10:
@@ -719,7 +848,9 @@ def main() -> None:
         return
 
     hybrid_body = None
-    if args.selection:
+    if args.multi_output and args.multi_bodies:
+        hybrid_body = [get_hybrid_body(part, body_name) for body_name in args.multi_bodies]
+    elif args.selection:
         hybrid_body = selected_container(document)
         if hybrid_body is None:
             raise KeyError("No selected CATIA container with HybridShapes. Select the point set and retry.")
@@ -733,6 +864,27 @@ def main() -> None:
                 print(f"[WARN] fallback: use selected container {item_name(hybrid_body)}.")
             else:
                 print("[WARN] fallback: search helper points globally in the active document.")
+
+    if args.multi_output:
+        measured_routes = measure_multi_route_points(part, spa_workbench, hybrid_body)
+        measured_guardians = measure_named_guardian_points(part, spa_workbench, hybrid_body)
+        measured_body = args.multi_bodies if args.multi_bodies else args.body
+        write_multi_route_points(args.multi_output, measured_body, measured_routes, measured_guardians)
+        print("=== CATIA Multi-Pipe Route Points ===")
+        if isinstance(hybrid_body, (list, tuple)):
+            body_label = ", ".join(item_name(body) for body in hybrid_body)
+        else:
+            body_label = item_name(hybrid_body) if hybrid_body is not None else "(none)"
+        print(f"HybridBody: {body_label}")
+        print(f"PIPE_COUNT = {len(measured_routes)}")
+        for route in measured_routes:
+            print(f"{route['pipe_id']}: START={route['start']} GOAL={route['goal']}")
+        if measured_guardians:
+            print("GUARDIANS = " + ", ".join(item["name"] for item in measured_guardians))
+        else:
+            print("GUARDIANS = (none found)")
+        print(f"[SAVE] multi-pipe points: {Path(args.multi_output).resolve()}")
+        return
 
     use_aliases = not args.no_aliases
     requested = {

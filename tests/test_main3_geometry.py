@@ -51,6 +51,39 @@ class EngineeringGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(report["max_joint_tangent_error_deg"], 15.9453959009)
         self.assertTrue(all(item["rule"] == "joint_tangent" for item in report["violations"]))
 
+    def test_hard_waypoint_gets_local_straight_bridge(self):
+        waypoint = self.guide[2]
+        route = main3.build_line_arc_route(
+            self.guide,
+            28.575,
+            90,
+            4,
+            90,
+            protected_points=[waypoint],
+            protected_straight_min_mm=15,
+        )
+        geometry = self.geometry(route["segments"])
+        protected = route["protected_waypoint_geometry"]
+        self.assertTrue(geometry["valid"], geometry)
+        self.assertTrue(protected["valid"], protected)
+        item = protected["points"][0]
+        self.assertEqual(item["left_segment_type"], "line")
+        self.assertEqual(item["right_segment_type"], "line")
+        self.assertGreaterEqual(item["left_segment_length_mm"], 15)
+        self.assertGreaterEqual(item["right_segment_length_mm"], 15)
+        self.assertLessEqual(item["direction_error_deg"], 1e-4)
+
+    def test_hard_waypoint_must_remain_an_interior_point(self):
+        with self.assertRaisesRegex(RuntimeError, "interior engineering control point"):
+            main3.build_line_arc_route(
+                self.guide,
+                28.575,
+                90,
+                4,
+                90,
+                protected_points=[self.guide[0]],
+            )
+
     def test_joint_gap_and_changed_endpoint_are_rejected(self):
         segments = copy.deepcopy(self.build()["segments"])
         segments[1]["start"][2] += 0.1
@@ -128,12 +161,39 @@ class EngineeringGeometryTests(unittest.TestCase):
 
     def test_short_adjacent_bends_do_not_bypass_minimum_radius(self):
         guide = np.asarray([[0., 0, 0], [30., 0, 0], [30., 10, 0], [60., 10, 0]])
-        route = self.build(guide)
+        with self.assertRaisesRegex(RuntimeError, "uniform bend radius"):
+            self.build(guide)
+
+    def test_mixed_arc_radii_are_rejected_by_constraints(self):
+        route = self.build()
+        arc_indices = [
+            index for index, segment in enumerate(route["segments"])
+            if segment.get("type") == "arc"
+        ]
+        self.assertGreaterEqual(len(arc_indices), 2)
+        route["segments"][arc_indices[0]]["radius"] -= 1.0
         report = main3.validate_route_constraints(
             route["sampled_path"], route, main3.active_constraint_profile(),
         )
         self.assertFalse(report["valid"])
-        self.assertIn("bend_radius", {item["rule"] for item in report["hard_failures"]})
+        self.assertIn("uniform_bend_radius", {item["rule"] for item in report["hard_failures"]})
+
+    def test_distance_profile_uses_route_radius_and_keeps_signed_clearance(self):
+        space = {
+            "sections": [{
+                "x": 0.0,
+                "hard_obstacle_section_lines": [{"name": "obstacle", "lines": [[[0.0, 0.0], [0.0, 0.0]]]}],
+            }],
+        }
+        route = {
+            "name": "signed-clearance",
+            "color": "#000000",
+            "engineered_path": [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            "route_max_envelope_radius": 2.0,
+        }
+        profile = main3.distance_profile_for_route(space, route, "parts")
+        self.assertEqual(profile["route_envelope_radius"], 2.0)
+        self.assertTrue(all(value == -2.0 for value in profile["clearance"]))
 
     def test_engineer_route_exports_final_geometry_report(self):
         source = {
@@ -161,6 +221,49 @@ class EngineeringGeometryTests(unittest.TestCase):
         self.assertEqual(result["turn_count"], 4)
         self.assertIn("collision_report", result)
         self.assertIsNone(result["collision_report"])
+
+    def test_large_turn_adapts_radius_and_removes_short_endpoint_connector(self):
+        # 管3式路径：端部切向锚点后只有约 11 mm 的短连接段，挂点必须保持
+        # 直线穿过；统一 R15 会失败，工程化应在实际切线余量内选择更大的半径。
+        guide = np.asarray([
+            [-6.8618677, 396.8954579, 392.9177502],
+            [-6.8618660, 404.5685038, 363.9156060],
+            [-6.8618677, 410.0, 354.5],
+            [93.1381323, 370.0, 394.5],
+            [193.1381323, 190.0, 394.5],
+            [238.4519063, 31.9997761, 330.2254978],
+            [213.1381323, 10.0, 414.5],
+            [273.4519063, -18.0002245, 440.2254431],
+            [303.4519063, -18.0002250, 440.2253962],
+        ])
+        guardian = guide[5].tolist()
+        source = {
+            "name": "PIPE_03_large_turn",
+            "path": guide.tolist(),
+            "search": {"endpoint_tangency": {
+                "applied": True,
+                "start": {"curve_point_count": 3},
+                "goal": {"curve_point_count": 3},
+            }},
+        }
+        params = main3.make_engineering_params({
+            "pipe_id": "PIPE_03",
+            "pipe_spec": "metal_9",
+            "outer_radius": 4.5,
+            "required_hangers": [{"name": "GUADIAN_03#1", "point": guardian}],
+            "start": guide[0].tolist(),
+            "goal": guide[-1].tolist(),
+            "start_dir": guide[1].tolist(),
+            "goal_dir": [333.4519063, -18.0002254, 440.2253494],
+        })
+        result = main3.engineer_route(source, "#2563eb", params)
+        self.assertGreater(result["bend_radius"], 15.0)
+        self.assertEqual(result["radius_selection"], "largest_feasible_for_large_turn")
+        self.assertGreater(result["arc_count"], 0)
+        self.assertTrue(result["geometry_report"]["valid"])
+        self.assertTrue(result["constraint_report"]["valid"])
+        self.assertTrue(result["protected_waypoint_geometry"]["valid"])
+        self.assertNotIn(guide[2].tolist(), result["control_path"])
 
 
 if __name__ == "__main__":

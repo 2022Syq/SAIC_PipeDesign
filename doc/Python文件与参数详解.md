@@ -69,6 +69,23 @@ flowchart TD
 
 后文依次说明配置与调度、模型和坐标准备、底层几何工具，以及 `main1` 到 `main4`。函数按功能成组列出，方便在 VS Code 中按 `Ctrl+F` 搜索函数名。
 
+## 1014 多管路整改契约
+
+多管入口对外只保留每条管路的一条路线；搜索内部可以尝试不同策略和局部回退。
+`completed` 必须同时满足：没有硬障碍冲突、没有管间扫掠包络相交、工程化几何有效，
+并且没有使用 fallback。允许硬冲突的配置只用于诊断，不能把冲突路线当作完成路线。
+
+当前障碍物额外净空、规划额外净空和工程化安全带均为 `0 mm`。`required_clearance=0`
+只表示不增加额外壁间隙；管外半径仍参与包络检查，负有符号净距表示实体相交并判定
+失败，零净距相切可以通过。起点、终点或硬挂点若小于两管外半径之和，报告为输入点位
+冲突。固定 `priority` 顺序下，程序先在当前管路内局部回退并尝试其他方向；穷尽后仍无解
+就记录阻塞原因、实际局部通道宽度、所需宽度和缺口值，并请示是否换序，不自动换序；两管之间则记录有符号包络净距和两管外半径之和对应的中心距要求。
+
+严格规划或工程化失败时，HTML 可以保留一条明确标记为诊断失败的路线供复盘，但不登记
+为已占用路线，也不生成正式 CATPart。工程化管子的外径沿全长一致，所有转弯都必须是
+圆弧并使用同一条路线选定的中心线弯曲半径；该半径不小于规格最低值。相邻直段不足以
+容纳候选半径时回退或失败，不能以尖角折线或缩小单个圆角替代。
+
 
 ## settings.py：整个项目的参数控制面板
 
@@ -88,7 +105,7 @@ flowchart TD
 | `GOAL` | `[303.451906833262, 12.999672776061, 440.22547724222]` | 管道中心线终点。 |
 | `START_DIR_POINT` | `[51.982415501506, -18.194718322136, 554.539254174035]` | 减去 START 得到起点期望行进方向。 |
 | `GOAL_DIR_POINT` | `[313.451906833115, 12.999671724166, 440.225375445311]` | 减去 GOAL 得到终点期望行进方向。 |
-| `HANGER_POINTS` | `[]` | 吊点坐标列表；main_point.py 可搜索 GUADIAN、GUADIAN1～GUADIAN10 后写入。 |
+| `HANGER_POINTS` | `[]` | 单管旧入口的挂点坐标列表；main_point.py 可搜索 GUADIAN、GUADIAN1～GUADIAN10 后写入，仍用于距离报告。 |
 | `HANGER_POINT_DISTANCE_RANGE` | `100.0` | 每个吊点到路线中心线允许的最大距离。当前列表为空时没有吊点距离约束需要满足。 |
 
 文件前面还有一组被三引号包住的旧端点。这部分是字符串内容，不是当前生效的赋值。两个方向参考点用来规定朝向，不等同于路线必须经过的中间点。
@@ -97,8 +114,8 @@ flowchart TD
 
 | 参数 | 当前值 | 用途 |
 |---|---:|---|
-| `PIPE_DIAMETER` | 50.0 | 管道外径。 |
-| `PIPE_RADIUS` | `PIPE_DIAMETER / 2.0`，即 25.0 | 将管表面净空换成中心线避让距离，也供管体显示使用。 |
+| `PIPE_DIAMETER` | 由 `ACTIVE_PIPE_SPEC` 动态派生 | 单管默认规格的外径。多管入口不使用这个全局值，而从每根管的 `pipe_spec` 读取。 |
+| `PIPE_RADIUS` | 由 `PIPE_DIAMETER / 2.0` 动态派生 | 单管默认规格的外半径。多管规划空间使用所有管路中的最大外半径，工程化和 CATPart 输出再使用每根管自己的外半径。 |
 | `DEFAULT_OBSTACLE_CLEARANCE` | 20.0 | 一般障碍物所需的管表面净空。 |
 | `DEFAULT_GROUND_CLEARANCE` | 150.0 | 确定管道中心线最低离地高度时使用的净空。 |
 | `DEFAULT_COMPONENT_SOLID` | True | 默认把封闭的障碍截面内部也视为占用区。 |
@@ -110,7 +127,7 @@ flowchart TD
 | `ground` | `role="ground"`、`clearance=150.0`、`boundary="hard"` | 地面部件。当前空间主流程只把 role 为 obstacle 的部件送入障碍切片；ground 用来推断地面高度，即使这里标 hard 也不是按普通硬障碍参与截面差集。 |
 | `see_through` | `role="obstacle"`、`clearance=0.0`、`solid=False`、`boundary="soft"` | 软边界部件，保留截线，不从 main1 自由区域直接扣除；后续由路线策略决定能否通过。 |
 
-`role` 回答“这是什么部件”；`boundary` 回答“如何参与避让”；`solid` 回答“是否填充封闭轮廓内部”。这三个字段承担不同职责。普通障碍的中心线避让半径为 `PIPE_RADIUS + clearance`，按当前默认值为 25 + 20 = 45 mm。
+`role` 回答“这是什么部件”；`boundary` 回答“如何参与避让”；`solid` 回答“是否填充封闭轮廓内部”。这三个字段承担不同职责。普通障碍的中心线避让半径为当前规划外半径加 `clearance`；多管共享空间按最大管外半径计算。
 
 ### 空间范围、网格与截面精度
 
@@ -155,7 +172,7 @@ main2 的当前入口执行双 X/Y 截面格点 A* 搜索。格点是离散候�
 | `JOINT_HEURISTIC_WEIGHT` | 1.08 | 预计剩余距离的权重，偏大时更倾向朝目标搜索，不能等同数学最短路径保证。 |
 | `JOINT_ENDPOINT_TANGENT_LENGTH` | 30.0 | 起终点方向锚点的目标直线长度。 |
 | `JOINT_SMOOTH_LOOKAHEAD` | 80 | 简化折线时，向前尝试直连的节点窗口。 |
-| `MAIN2_EXTRA_CLEARANCE` | 20.0 | 对 main1 自由区域额外内缩的量，允许 0～20。主干采用该安全余量，固定端点及必要过渡可按原基础净空验收，因此不能解释成整条路线无条件都有额外 20 mm。 |
+| `MAIN2_EXTRA_CLEARANCE` | 0.0 | 本轮多管整改不叠加规划额外净空；管外半径和硬障碍边界仍参与验收。 |
 | `SOFT_BAD_WEIGHT` | 18000.0 | profile 的常规软边界惩罚默认值。 |
 | `ENGINEER_SOFT_BAD_WEIGHT` | 1800.0 | 第五种允许软边界方案采用的较低软惩罚。 |
 | `HARD_BAD_WEIGHT` | 260000.0 | 旧评分逻辑中的硬违规代价。当前主 A* 直接拒绝硬碰撞，不靠调整此值允许穿过硬障碍。 |
@@ -209,14 +226,16 @@ main2 中还有通过 `getattr(settings, 名称, 默认值)` 读取的可选参�
 | 参数 | 当前值 | 用途 |
 |---|---|---|
 | `ENGINEERING_SOURCE_ROUTE_NAME` | None | None 表示处理所有 main2 方案；可指定一个方案名。 |
-| `ENGINEERING_BEND_RADIUS` | 150.0 | 优先尝试的中心线圆角半径。 |
+| `ENGINEERING_BEND_RADIUS` | 150.0 | 旧 route JSON 缺少规格半径字段时的几何兜底；当前 SAAA 主流程使用 `PIPE_SPECS`，不是固定最终半径。 |
 | `ENGINEERING_MAX_BEND_ANGLE_DEG` | 90.0 | 当前同时用作最小内部夹角和单段圆弧最大分段角。名字只表达了其中一层含义。 |
 | `ENGINEERING_ARC_SAMPLE_ANGLE_DEG` | 4.0 | 圆弧离散采样的角间隔。 |
 | `ENGINEERING_SIMPLIFY_TOLERANCE` | 25.0 | RDP 控制折线简化容差。 |
 | `ENGINEERING_MAX_TURN_COUNT` | 10 | 主布置转角数量的控制目标，主要用于限制中间控制点数；两端保护链另行保留，最终没有对报告转角数再执行一次上限检查。 |
-| `ENGINEERING_MIN_BEND_RADIUS` | 25.0 | 候选半径尝试列表的下限。`fillet_corner` 还可能因相邻直线短而缩小实际半径，当前未逐圆弧复核该下限，不能说最终所有圆弧实际半径都被硬保证不小于 25。 |
-| `ENGINEERING_BEND_RADIUS_STEP` | 10.0 | 候选圆角半径递减步长。 |
-| `ENGINEERING_VALIDATION_EXTRA_CLEARANCE` | 2.0 | 最终双截面验收的额外数值安全带，用于补偿近似误差。 |
+| `ENGINEERING_MIN_BEND_RADIUS` | 25.0 | 历史保留参数，当前主流程不使用；实际硬下限来自当前规格的 `minimum_bend_radius`。 |
+| `ENGINEERING_BEND_RADIUS_STEP` | 10.0 | 普通路线从搜索参考值向规格硬下限递减的候选步长；不会把正式圆弧降到硬下限以下。 |
+| `ENGINEERING_ALLOW_LARGE_TURN_AFTER_DEG` | 90.0 | 超过该物理转角时启用大转弯处理和自适应半径候选。 |
+| `ENGINEERING_ADAPTIVE_BEND_RADIUS_STEP_MM` | 1.0 | 大转弯半径候选的搜索步长；候选下限仍是规格硬下限，上界由各角切线余量估算。 |
+| `ENGINEERING_VALIDATION_EXTRA_CLEARANCE` | 0.0 | 本轮工程化与规划使用同一套实体外缘净空口径，不追加安全带。 |
 | `ENGINEERING_Z_SIMPLIFY_TOLERANCE` | 0.0 | Z 高度简化容差，0 表示关闭。 |
 | `ENGINEERING_MIN_SEGMENT_LENGTH` | 40.0 | 控制点清理时删除过近点的阈值，不等于最终每段制造直线长度均不小于 40 的验收保证。 |
 | `ENGINEERING_S_BEND_MIN_TURN_DEG` | 110.0 | S 形折返识别的转角条件。 |
@@ -429,7 +448,8 @@ python upload.py --only 示例 --visible
 | `DEFAULT_NAMES` | 定义四个必需点的默认名称：`START`、`GOAL`、`START_DIR_POINT`、`GOAL_DIR_POINT`。 |
 | `START`、`GOAL` | 管路起点、终点坐标。 |
 | `START_DIR_POINT`、`GOAL_DIR_POINT` | 定义端点方向的辅助点坐标；它们仍是点，不是已经归一化的方向向量。方向计算由下游代码完成。 |
-| `HANGER_POINT_NAMES` | 可选挂点名称：`GUADIAN`、`GUADIAN1` … `GUADIAN10`，共 11 个候选名称。 |
+| `HANGER_POINT_NAMES` | 单管旧入口的可选挂点名称：`GUADIAN`、`GUADIAN1` … `GUADIAN10`。 |
+| `GUARDIAN_POINT_PATTERN` | 多管硬挂点名称模式：例如 `GUADIAN_01#1`、`GUADIAN_02#1`；`--multi-output` 会将它们写入测量点 JSON 的 `guardians`。 |
 | `DEFAULT_ALIASES` | 默认名称找不到时允许尝试的别名；只有该项仍使用默认请求名称时，才追加这些别名。 |
 
 | 配置项 | 允许尝试的默认别名 |
@@ -505,7 +525,7 @@ python upload.py --only 示例 --visible
 1. 默认操作活动 CATPart，脚本不会从磁盘打开辅助点模型；选中的文档没有 Part 时会报错。
 2. 默认寻找名为 `point` 的点集；找不到时尝试当前选中的容器，再不行就在全文档搜索辅助点。
 3. 如果点集已经找到，四个点就在该点集直接包含的 `HybridShapes` 中查找；点集存在但缺少某个点时，当前流程不会为这个缺失点再次自动全局搜索。
-4. 四个核心点必须都能测量。挂点可选；一个挂点也没找到时，默认保存行为会将 **`HANGER_POINTS` 写为 `[]`**，不会保留旧挂点。
+4. 四个核心点必须都能测量。单管旧挂点可选；一个挂点也没找到时，默认保存行为会将 **`HANGER_POINTS` 写为 `[]`**。多管 `--multi-output` 另外扫描 `GUADIAN_<编号>#<序号>`，写入 `guardians`，不会把它们混入单管全局列表。
 5. 挂点按预设名称顺序收集，重复坐标保留首次出现的名称。
 6. 测量坐标直接写入配置；本文件没有装配实例坐标变换、单位换算或额外坐标系变换。
 7. `settings.py` 如果有多个同名赋值，语法树扫描记录会保留最后遇到的赋值并替换它。当前源文件后面的端点赋值才是 Python 执行后生效的值。替换采用整段赋值语句所在行，不能理解为保证保留被替换行末的注释。
@@ -643,11 +663,11 @@ STEP/IGES 文件先读取成 OCC 的 `Shape`，即 CAD 几何对象，再离散�
 
 ### 当前实现的实际边界
 
-`main2` 和 `main3` 在生成路线后调用报告，把结果写入 `hanger_distance` 和 `hanger_valid`。当前挂点不是“路径必须经过”的求解硬约束，未调用的 `hanger_reference_cost` 也不能算成已经生效的优化功能。
+单管 `settings.HANGER_POINTS` 仍由 `main2` 和 `main3` 生成距离报告，未进入单管 A*。多管 JSON 的 `required_hangers` 是例外：`main2.plan_pipe_routes()` 会把每个硬挂点插入引导中心线，`main3.engineer_route()` 保留这些点并再次检查；任一点无法经过时，该候选失败。`hanger_reference_cost` 仍未作为搜索代价使用。
 
 没有挂点时，`all_within_range=True`：其含义只是没有待检查的点，不能证明真实支架布置已经合格。报告中的名称重新编号成 `GUADIAN1`、`GUADIAN2` 等，不保留原 CAD 中可能存在的 `GUADIAN` 或跳号名称。
 
-`main3` 使用圆弧采样点形成的折线检查距离，是对实际圆弧距离的近似。这个工具也不检查支架本体、安装方向、螺栓孔或支架碰撞。
+`required_hangers` 的零容差检查针对路线中心线坐标，不等同于支架实体、安装方向或螺栓孔检查；支架本体仍由 CAD 障碍模型负责。普通 `HANGER_POINTS` 报告仍使用允许距离，不减管半径。
 
 
 
@@ -670,7 +690,7 @@ STEP/IGES 文件先读取成 OCC 的 `Shape`，即 CAD 几何对象，再离散�
 输入：main1 的规划空间 JSON、`settings` 中的方向与搜索参数。主入口优先读 `SPACE_JSON`，没有时才读 `SPACE_CHECKPOINT_JSON`；检查点必须包含足够完整的两类截面才有意义。
 
 1. `section_polygons()` 把 JSON 中的自由区域重建为 Shapely 多边形。
-2. 按 `MAIN2_EXTRA_CLEARANCE` 向内缩自由区域，形成主干搜索模型；另建一份基础净空模型用于端点连接和最终基础验收。
+2. 按 `MAIN2_EXTRA_CLEARANCE` 向内缩自由区域，形成主干搜索模型；本轮值为 `0 mm`，因此不再叠加规划安全带，但管外半径和硬障碍仍由截面模型拒绝。
 3. `get_start_dir()`、`get_goal_dir()` 计算两端方向。
 4. `make_profiles()` 建立五种路线偏好。
 5. 对每种偏好建立端点方向锚点、连接格点，执行 A*，再尝试用可通行直线删去多余节点。
@@ -703,7 +723,7 @@ main2 使用的起终点优先来自规划空间 JSON，而方向点来自当前
 | `smooth_joint_path()` | 保护两端锚点附近的连接链，对中间路线进行直连简化 |
 | `smooth_joint_path_unlocked()` | 在给定前瞻窗口内，寻找能安全直连的最远节点，删除中间冗余节点 |
 | `endpoint_anchor_tangency_info()` | 检查起终点是否保留方向锚点，记录直线长度、保护点数和方向误差 |
-| `build_joint_route()` | 组织搜索、验证、挂点报告，整理兼容旧查看器的数据字段 |
+| `build_joint_route()` | 组织搜索、验证、挂点报告；多管入口还插入并验证 `required_hangers` 硬挂点，整理兼容旧查看器的数据字段 |
 | `distance_to_lines()`、`sampled_path()`、`export_distance_png()` | 按路线里程采样，估算到各零件截线的管外壁距离，绘制 PNG |
 | `export_html()` | 将零件网格、路线和挂点组织为 Plotly 三维网页 |
 | `main()` | 依次计算五种策略、保存文件、输出运行信息 |
@@ -765,7 +785,8 @@ main2 使用的起终点优先来自规划空间 JSON，而方向点来自当前
 | A* 邻边 `sample_step=max(ROUTE_SEGMENT_SAMPLE_STEP,10.0)` | 当前邻边检查不会用小于 10 mm 的均匀采样步长；此外仍加入截面交点 |
 | `ROUTE_SEGMENT_SAMPLE_STEP` | 其他路径检查和 `DualSectionModel.segment_check()` 的默认步长目前为 8 mm |
 
-`MAIN2_EXTRA_CLEARANCE` 的 20 mm 是对已有自由区域向内收缩，既影响障碍旁空间，也影响规划区域边缘。端点锚点和连接段按基础净空模型处理，因此不能把“设置 20”理解成整条路径每处都另加了 20 mm。
+本轮 `MAIN2_EXTRA_CLEARANCE=0`，不对已有自由区域额外收缩。若后续把该值改为正数，
+必须重新运行 main2；它会同时影响障碍旁空间和规划区域边缘，不能只重画管体。
 
 ### 保留的旧双向搜索模块
 
@@ -816,6 +837,9 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 | `hard_bad_samples`、`soft_bad_samples` | 相应违规采样计数，不是连续碰撞长度 |
 | `search` | 展开节点数、点数、搜索代价、方向锚点及端点切向检查 |
 | `hanger_distance`、`hanger_valid` | 生成后的挂点距离报告及是否全部在范围内 |
+| `hard_waypoints`、`hard_waypoint_names` | 多管配置传入的硬挂点坐标和名称；单管旧入口通常为空 |
+| `hard_waypoint_report`、`hard_waypoint_valid` | 每个硬挂点到中心线的距离报告；多管要求零容差全部通过 |
+| `profile_failures` | `plan_pipe_routes()` 中因硬挂点或规划约束失败的策略；其余策略仍会继续尝试 |
 | `front_path`、`rear_path`、`meeting_point` | 当前是为兼容旧显示而把整条路径从中间拆开，不是两端独立搜索的证据 |
 | `axis_switches` | 相邻段在“更偏 X”与“更偏 Y”之间切换次数，不等于真实三维弯头数 |
 | 根对象 `valid_segments` | 首选路线只要有任一硬/软违规就记 0，否则记全部线段数；它不是逐段实际合格数的累加 |
@@ -834,12 +858,12 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 ### 执行步骤
 
 1. `selected_source_routes()` 决定处理哪些 main2 方案，默认全部。
-2. 从规划空间建立新的双截面检查模型，附加 `ENGINEERING_VALIDATION_EXTRA_CLEARANCE=2` mm 数值安全带。
+2. 从规划空间建立新的双截面检查模型；本轮 `ENGINEERING_VALIDATION_EXTRA_CLEARANCE=0`，工程化与规划使用同一套实体外缘净空口径。
 3. `engineer_route()` 读取导引点，识别 main2 标记的端点保护链。
 4. 尝试高度简化、RDP 简化、近点清理、S 弯和指定方案的摆动清理。
 5. 主流程再通过 `collision_constrained_control_path()` 选择每一条直连都安全、控制点数量受限的中间路径；它会覆盖前面部分简化结果，因此不是每个预处理参数都会直接改变最终形状。
-6. 从优先半径 150 mm 开始，按 10 mm 递减，最后尝试 25 mm，生成直线/圆弧候选；对夹角和采样净空进行检查。
-7. 成功则保存管体显示网格、圆弧段和报告；单条方案发生 `RuntimeError` 会放入 `failed_routes` 并跳过，全部失败则报错。
+6. 以当前规格的最低中心线弯曲半径为硬下限，从搜索参考值和几何可行范围生成候选；同一条管路所有转弯使用同一选定半径，并检查夹角、圆弧半径和采样净空。相邻直段不足以容纳某个候选时，候选失败并回退，不把单个圆角缩小后继续建模。
+7. 成功则保存管体显示网格、圆弧段和报告；严格方案全部失败时只保留 HTML 诊断路线，不生成正式 CATPart。
 
 还有一层控制路径回退：如果原始导引线点数不超过 `max_turn_count+2`，且与首选控制线不同，会把它加入第二候选；程序先尝试首选控制线的全部半径，再尝试这条原始导引线。
 
@@ -887,18 +911,19 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 
 ### 三组最容易混淆的参数
 
-**第一组：半径。** `PIPE_RADIUS=25` mm 表示管外径为 50 mm；`ENGINEERING_BEND_RADIUS=150` mm 表示优先采用 R150 的中心线弯曲。
+**第一组：半径。** `PIPE_RADIUS=25` mm 表示管外径为 50 mm。SAAA 中的 R15、R20 等是最低中心线弯曲半径，不是最终固定值；例如 `metal_9` 的 R15 最低要求可以通过 R22 满足。`ENGINEERING_BEND_RADIUS=150` mm 只为缺少规格半径字段的旧 route JSON 提供几何兜底。
 
-外层搜索会按 `ENGINEERING_MIN_BEND_RADIUS` 限制尝试半径，但 `fillet_corner()` 还会根据相邻线段长度缩小实际圆角：
+当前整改要求所有最终圆弧都满足规格最低半径，且同一条管路的转弯半径一致。若相邻线段太短，
+正确处理是拒绝当前候选并回退到另一个半径或控制折线，而不是缩小单个圆角：
 
 ```text
-希望占用的切向长度 = 尝试半径 × tan(转向角 / 2)
-允许占用的切向长度 = 0.45 × min(前一段长度, 后一段长度)
-实际切向长度 = 两者中的较小者
-实际圆角半径 = 实际切向长度 / tan(转向角 / 2)
+所需切向长度 = 候选弯曲半径 × tan(转向角 / 2)
+若前后直段不能同时容纳所需切向长度，则该转角不可行
 ```
 
-因此 `ENGINEERING_MIN_BEND_RADIUS=25` 并不保证每一个最终圆弧的 `radius` 都≥25。当前没有在输出前逐圆弧重新检查这个下限。JSON 根对象的 `bend_radius` 保存配置首选值；每条 `routes[i].bend_radius` 才是该路线选中的尝试半径；实际圆弧半径应看该路线各个 `segments` 中的 `radius`。
+因此 JSON 中路线的 `requested_bend_radius` 是搜索参考值，`bend_radius` 是最终选定值；
+正式路线中所有圆弧的 `segments[].radius` 必须与 `bend_radius` 一致，且不小于规格
+`minimum_bend_radius`。出现半径缩小、尖角折线或无法形成相切圆弧时，路线只能作为诊断结果。
 
 **第二组：角度。** `ENGINEERING_MAX_BEND_ANGLE_DEG=90` 当前同时被传入两个位置：内部夹角最小值，以及单段圆弧最大分段角。它不是一个语义单一的“最大转弯角”开关。直线继续前进时内部夹角接近 180°，直角转弯内部夹角为 90°；内部夹角越小，回折越尖。
 
@@ -917,23 +942,27 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 | `engineered_path` | 直线和圆弧采样成的点列，用于显示及离散检查 |
 | `segments` | 真正交给 main4 的几何描述：`line` 含起终点；`arc` 另含圆心、实际半径和圆弧角 |
 | `tube_mesh` | 管体显示用三角网格，没有壁厚、材料或制造属性 |
-| 路线内 `requested_bend_radius`、`bend_radius` | 用户首选半径与该路线选中尝试半径，不等同所有圆弧实际半径；JSON 根对象的 `bend_radius` 仍是配置首选值 |
-| `radius_reduced_count` | 因局部长度不足而缩小半径的转角数量 |
+| 路线内 `requested_bend_radius`、`bend_radius` | 前者是规格推荐值提升后的搜索参考，后者是最终选定的统一中心线半径；正式路线中所有圆弧的 `segments[].radius` 必须与 `bend_radius` 相同且不小于规格最低值 |
+| `radius_reduced_count` | 正式路线必须为 `0`；若无法保持统一半径则路线失败并转为诊断 |
 | `arc_count`、`turn_count`、`main_turn_count` | 圆弧段数、生成圆角的转角数；当前 `main_turn_count` 与 `turn_count` 完全相同；一个转角可能拆成多段圆弧 |
 | `corner_angle_valid`、`corner_angle_violations` | 控制折线内部夹角检查及不满足项 |
 | `endpoint_tangent_protected` | 是否识别并保留 main2 的两端保护链 |
 | `guide_length`、`engineered_length` | 输入折线长度与工程采样折线长度；后者是圆弧长度的采样近似 |
 | `s_bend_removed_points`、`wiggle_removed_points` | 预处理阶段删点计数，不应直接当作最终路径减少的制造弯数 |
-| `hanger_distance`、`hanger_valid` | 工程化后的挂点距离报告，仍不自动排除不合格路线 |
+| `hanger_distance`、`hanger_valid` | 工程化后的单管旧挂点距离报告，仍不自动排除不合格路线 |
+| `hard_waypoints`、`hard_waypoint_names` | 需要中心线经过的多管硬挂点及其名称 |
+| `hard_waypoint_report`、`hard_waypoint_valid` | 对工程化采样中心线的零容差复核；不通过时该候选失败 |
 | 顶层 `failed_routes` | 未能完成重构的方案名称与失败原因 |
 
 ### 当前源码中与使用有关的边界
 
 第一，main2 当前 `build_joint_route()` 把 `allow_soft` 放在 `strategy_weights` 内，main3 却从路线顶层 `source_route.get("allow_soft", False)` 读取。因此当前输出链中第五种软边界策略到 main3 可能按“不允许软边界”重构；不能认为名称里有 `engineer_soft` 就一定能沿软边界通过。
 
-第二，`build_line_arc_route()` 会跳过控制折线第一个和最后一个内部顶点的圆角化，以保留端点连接结构；这意味着端点方向符合要求，不代表所有连接处已经处处相切连续。
+第二，`build_line_arc_route()` 会跳过控制折线第一个和最后一个内部顶点的圆角化，以保留端点连接结构；多管硬挂点也会被保留为实际中心线点并跳过该点圆角化。因此硬点若恰好是转角，可能因 G1 切向不连续而被工程化验收拒绝；当前支持的安全语义是硬点落在可通过的直线段上。
 
-第三，工程化检查是在原规划空间上重新增加 2 mm 安全带；它并不是在 main2 的额外 20 mm 上继续加 2 mm。因此 main2 与 main3 的额外安全余量不能简单相加成全路径 22 mm。
+第三，本轮整改将障碍物额外净空、`MAIN2_EXTRA_CLEARANCE` 和
+`ENGINEERING_VALIDATION_EXTRA_CLEARANCE` 都设为 `0 mm`。这只取消额外壁间隙，不取消
+管外半径；有符号净距小于 `0` 仍是实体相交，工程化不能比规划阶段更宽松。
 
 第四，圆角和直段生成不等于所有水管工艺已实现。当前没有完整的焊缝位置、阀座直段、套管避让、壁厚，以及刚性管失败后软管替代等制造功能模块。这些需在后续明确规则后接入；本文不把它们当成现成功能。
 
@@ -987,7 +1016,9 @@ settings 中 `BIDIR_*` 大多为这组旧模块服务；`BIDIR_Z_UP_PENALTY` 仍
 
 ### 输出行为需要知道的细节
 
-如果扫掠失败，代码会打印警告，仍保存已生成的节点和线/圆弧中心线。因此 CATPart 文件存在，不等于完整管体扫掠一定成功。
+如果扫掠失败，中心线可以作为诊断证据保留在 HTML/JSON，但多管编排不会把它标成正式
+完成，也不会为该失败路线生成正式 CATPart。只有扫掠和几何验收都通过的路线才进入
+`main4.create_catia_part()`。
 
 `create_circular_sweep()` 使用 `HybridShapeFactory` 的圆形扫掠；代码没有建立内径、壁厚或完整空心管制造特征。仅凭日志中的“pipe created”不能确认已经获得带壁厚的可制造实体。
 

@@ -18,8 +18,14 @@ import numpy as np
 
 import settings
 from common_space import html_aspect_ratio, html_x_range, load_json, load_step_meshes_for_html, save_json
-from hanger_utils import hanger_distance_report, settings_hanger_points
-from main2 import DualSectionModel, joint_segment_allowed, joint_validate_path, section_polygons
+from hanger_utils import hard_waypoint_report, hanger_distance_report, settings_hanger_points
+from main2 import (
+    DualSectionModel,
+    hard_conflict_report,
+    joint_segment_allowed,
+    joint_validate_path,
+    section_polygons,
+)
 
 
 ROUTE_COLORS = ["#ef2929", "#111827", "#2563eb", "#16a34a", "#f97316"]
@@ -49,23 +55,36 @@ def cumulative_lengths(path: np.ndarray) -> np.ndarray:
     return np.asarray(values, dtype=float)
 
 
-def active_constraint_profile() -> dict:
+def active_constraint_profile(spec_id: str | None = None, envelope_radius: float | None = None, pipe_segments=None) -> dict:
     """Resolve the selected air-conditioning pipe rules for this run.
 
     The planning space still uses one conservative route envelope.  Segment
     assignments are carried in the output for the engineer's next test; until
     coordinates are supplied, engineering uses the active/default core spec.
     """
-    spec_id = str(getattr(settings, "ACTIVE_PIPE_SPEC", ""))
+    spec_id = str(spec_id or getattr(settings, "ACTIVE_PIPE_SPEC", ""))
     specs = getattr(settings, "PIPE_SPECS", {})
     if spec_id not in specs:
         raise ValueError(f"ACTIVE_PIPE_SPEC is not defined: {spec_id}")
     spec = dict(specs[spec_id])
     if spec.get("kind") != "metal":
         raise ValueError("ACTIVE_PIPE_SPEC must identify the continuous metal core")
-    spec_ids = sorted(getattr(settings, "selected_pipe_spec_ids", lambda: {spec_id})())
+    if pipe_segments is None:
+        spec_ids = sorted(getattr(settings, "selected_pipe_spec_ids", lambda: {spec_id})())
+    else:
+        spec_ids = {spec_id}
+        for segment in pipe_segments:
+            spec_ids.add(str(segment.get("core_spec", spec_id)))
+            if segment.get("cover_spec"):
+                spec_ids.add(str(segment["cover_spec"]))
+        unknown = spec_ids.difference(specs)
+        if unknown:
+            raise ValueError(f"Unknown pipe specs: {sorted(unknown)}")
+        spec_ids = sorted(spec_ids)
     # 当前运行按一个主动金属规格工程化；胶管规格先保留在分段元数据中，
     # 等工程师提供区间后再对局部中心线应用胶管半径。
+    # SAAA 半径是最低要求。recommended 仅作搜索参考，并提升到硬下限；
+    # preferred 不限制最终半径上限，大转角搜索可以选用更大的统一半径。
     preferred = max(
         float(spec.get("recommended_bend_radius", 0.0)),
         float(spec.get("minimum_bend_radius", 0.0)),
@@ -73,7 +92,7 @@ def active_constraint_profile() -> dict:
     hard_min = float(spec.get("minimum_bend_radius", preferred))
     cover_ids = [
         str(segment.get("cover_spec"))
-        for segment in getattr(settings, "PIPE_SEGMENTS", [])
+        for segment in (getattr(settings, "PIPE_SEGMENTS", []) if pipe_segments is None else pipe_segments)
         if segment.get("cover_spec")
     ]
     return {
@@ -84,12 +103,16 @@ def active_constraint_profile() -> dict:
         "flexibility": spec.get("flexibility", "rigid"),
         "preferred_bend_radius": preferred,
         "minimum_bend_radius": hard_min,
-        "envelope_radius": float(getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", float(spec["outer_diameter"]) / 2.0)),
+        "envelope_radius": float(
+            envelope_radius
+            if envelope_radius is not None
+            else getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", float(spec["outer_diameter"]) / 2.0)
+        ),
         "core_outer_radius": float(spec["outer_diameter"]) / 2.0,
         "straight_recommended": spec.get("straight_recommended"),
         "straight_minimum": spec.get("straight_minimum"),
         "spec_ids": spec_ids,
-        "pipe_segments": list(getattr(settings, "PIPE_SEGMENTS", [])),
+        "pipe_segments": list(getattr(settings, "PIPE_SEGMENTS", []) if pipe_segments is None else pipe_segments),
     }
 
 
@@ -101,7 +124,7 @@ def turn_angle_degrees(prev_pt: np.ndarray, vertex: np.ndarray, next_pt: np.ndar
     return float(math.degrees(math.acos(dot)))
 
 
-def merge_small_turns(path: np.ndarray, minimum_turn_deg: float) -> np.ndarray:
+def merge_small_turns(path: np.ndarray, minimum_turn_deg: float, preserve_points=None) -> np.ndarray:
     """Remove small interior turns without changing the endpoint directions."""
     points = remove_close_points(np.asarray(path, dtype=float), 1e-6)
     if len(points) <= 2:
@@ -113,6 +136,9 @@ def merge_small_turns(path: np.ndarray, minimum_turn_deg: float) -> np.ndarray:
         for index in range(1, len(points) - 1):
             # 两端相邻控制点定义用户指定的切向，不能按小角度抖动删除。
             if index == 1 or index == len(points) - 2:
+                keep.append(points[index])
+                continue
+            if any(dist(points[index], point) <= 1e-6 for point in (preserve_points or [])):
                 keep.append(points[index])
                 continue
             angle = turn_angle_degrees(points[index - 1], points[index], points[index + 1])
@@ -197,6 +223,12 @@ def validate_route_constraints(path: np.ndarray, engineered: dict, profile: dict
             "rule": "bend_radius",
             "actual_mm": minimum_radius,
             "minimum_mm": profile["minimum_bend_radius"],
+        })
+    if arc_radii and max(arc_radii) - min(arc_radii) > 1e-6:
+        hard_failures.append({
+            "rule": "uniform_bend_radius",
+            "radii_mm": arc_radii,
+            "maximum_spread_mm": max(arc_radii) - min(arc_radii),
         })
 
     # 验收真实成形弯角，不能以控制点已简化代替验收；同圆分弧仍是一个弯。
@@ -408,6 +440,29 @@ def remove_close_points(path: np.ndarray, min_len: float) -> np.ndarray:
     if dist(out[-1], path[-1]) > 1e-6:
         out.append(np.asarray(path[-1], dtype=float))
     return np.asarray(out, dtype=float)
+
+
+def preserve_hard_waypoints(control: np.ndarray, guide: np.ndarray, waypoints) -> np.ndarray:
+    """Insert exact guide points into a simplified control path in order."""
+    result = [np.asarray(point, dtype=float) for point in remove_close_points(control, 1e-6)]
+    guide = np.asarray(guide, dtype=float)
+    for waypoint in waypoints or []:
+        point = np.asarray(waypoint, dtype=float)
+        guide_index = int(np.argmin(np.linalg.norm(guide - point, axis=1)))
+        if float(np.linalg.norm(guide[guide_index] - point)) > 1e-5:
+            raise RuntimeError(f"required guardian is not present in guide path: {point.tolist()}")
+        if any(dist(existing, point) <= 1e-6 for existing in result):
+            continue
+        control_indices = [
+            int(np.argmin(np.linalg.norm(guide - existing, axis=1)))
+            for existing in result
+        ]
+        insert_at = next(
+            (index for index, candidate_index in enumerate(control_indices) if candidate_index > guide_index),
+            len(result) - 1,
+        )
+        result.insert(max(1, insert_at), point)
+    return remove_close_points(np.asarray(result, dtype=float), 1e-6)
 
 
 def point_line_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
@@ -675,7 +730,19 @@ def selected_source_routes(result: dict) -> list[dict]:
     return [route_by_name(result, source_name)]
 
 
-def fillet_corner(prev_pt, vertex, next_pt, radius: float, max_arc_deg: float, sample_deg: float):
+class UniformBendRadiusError(RuntimeError):
+    """A corner cannot be filleted with the route's one selected radius."""
+
+
+def fillet_corner(
+    prev_pt,
+    vertex,
+    next_pt,
+    radius: float,
+    max_arc_deg: float,
+    sample_deg: float,
+    minimum_straight_mm: float = 5.0,
+):
     p0 = np.asarray(prev_pt, dtype=float)
     p1 = np.asarray(vertex, dtype=float)
     p2 = np.asarray(next_pt, dtype=float)
@@ -694,9 +761,31 @@ def fillet_corner(prev_pt, vertex, next_pt, radius: float, max_arc_deg: float, s
     if abs(tan_half) < 1e-9:
         return None
 
+    radius = float(radius)
+    if radius <= 0.0:
+        raise ValueError("bend radius must be positive")
+
+    # A manufacturing bend has one centerline radius for the whole route.
+    # The old implementation silently shortened the tangent distance when a
+    # corner was too close to its neighbours, which changed this corner's
+    # actual radius and produced a sharp/incorrect engineered route. Reject
+    # that candidate instead; the caller may try another single radius for
+    # the complete route.
     preferred_d = radius * tan_half
-    max_d = 0.45 * min(len_in, len_out)
-    d = min(preferred_d, max_d)
+    # Keep a real straight remainder on both sides of the bend.  The former
+    # 45% cap rejected otherwise manufacturable endpoint transitions (for
+    # example a 30 mm tangent anchor with an R15 bend).  A fixed residual is
+    # easier to audit and leaves the hard-waypoint bridge untouched.
+    minimum_straight = max(float(minimum_straight_mm), 0.0)
+    max_d = min(len_in, len_out) - minimum_straight
+    if preferred_d > max_d + 1e-6:
+        raise UniformBendRadiusError(
+            "uniform bend radius cannot fit corner: "
+            f"radius={radius:.6g} mm, required_tangent={preferred_d:.6g} mm, "
+            f"available_tangent={max_d:.6g} mm, "
+            f"minimum_straight={minimum_straight:.6g} mm"
+        )
+    d = preferred_d
     if d <= 1e-6:
         return None
 
@@ -747,12 +836,283 @@ def fillet_corner(prev_pt, vertex, next_pt, radius: float, max_arc_deg: float, s
     return {
         "turn_angle_deg": float(turn_deg),
         "radius": float(actual_radius),
-        "radius_reduced": bool(actual_radius < radius - 1e-6),
+        # Kept for the existing HTML/JSON schema. Infeasible corners raise
+        # above instead of silently changing the bend radius.
+        "radius_reduced": False,
         "tangent_in": t1,
         "tangent_out": t2,
         "samples": np.asarray(samples, dtype=float),
         "arc_segments": arc_segments,
     }
+
+
+def _insert_hard_waypoint_bridges(
+    guide: np.ndarray,
+    protected_points,
+    minimum_side_length: float,
+) -> np.ndarray:
+    """Insert a straight bridge through each exact hard waypoint.
+
+    The bridge is deliberately longer than the required straight length.  The
+    two new outer points may be rounded into the surrounding route, leaving a
+    straight, tangent-continuous segment through the protected point while the
+    rest of the route keeps the normal line/arc treatment.
+    """
+    points = np.asarray(guide, dtype=float)
+    protected = [np.asarray(point, dtype=float) for point in (protected_points or [])]
+    if not protected:
+        return points
+    minimum_side_length = float(minimum_side_length)
+    if minimum_side_length <= 0.0:
+        raise ValueError("hard waypoint minimum straight length must be positive")
+    bridge_half_length = 2.0 * minimum_side_length
+
+    for waypoint in protected:
+        distances = np.linalg.norm(points - waypoint, axis=1)
+        index = int(np.argmin(distances))
+        if float(distances[index]) > 1e-5:
+            raise RuntimeError(
+                "required guardian is not present in the engineering guide: "
+                f"{waypoint.tolist()}"
+            )
+        if index <= 0 or index >= len(points) - 1:
+            raise RuntimeError(
+                "required guardian must be an interior engineering control point: "
+                f"{waypoint.tolist()}"
+            )
+
+        incoming = norm(points[index] - points[index - 1])
+        outgoing = norm(points[index + 1] - points[index])
+        direction = norm(incoming + outgoing)
+        if float(np.linalg.norm(incoming + outgoing)) < 1e-9:
+            direction = incoming
+
+        left = waypoint - direction * bridge_half_length
+        right = waypoint + direction * bridge_half_length
+        points = np.vstack([points[:index], left, waypoint, right, points[index + 1:]])
+
+    return points
+
+
+def validate_hard_waypoint_geometry(
+    segments: list[dict],
+    protected_points,
+    minimum_side_length: float,
+) -> dict:
+    """Check the local straight, tangent-continuous bridge at each hard point."""
+    minimum_side_length = float(minimum_side_length)
+    reports = []
+    for point in (protected_points or []):
+        point = np.asarray(point, dtype=float)
+        left_indices = [
+            index for index, segment in enumerate(segments)
+            if dist(segment["end"], point) <= 1e-5
+        ]
+        right_indices = [
+            index for index, segment in enumerate(segments)
+            if dist(segment["start"], point) <= 1e-5
+        ]
+        left = segments[max(left_indices)] if left_indices else None
+        right = segments[min(right_indices)] if right_indices else None
+        left_length = dist(left["start"], left["end"]) if left else 0.0
+        right_length = dist(right["start"], right["end"]) if right else 0.0
+        left_direction = norm(
+            np.asarray(left["end"], dtype=float) - np.asarray(left["start"], dtype=float)
+        ) if left else np.zeros(3)
+        right_direction = norm(
+            np.asarray(right["end"], dtype=float) - np.asarray(right["start"], dtype=float)
+        ) if right else np.zeros(3)
+        direction_error = 180.0
+        if left is not None and right is not None:
+            direction_error = float(math.degrees(math.acos(max(
+                -1.0, min(1.0, float(np.dot(left_direction, right_direction)))
+            ))))
+        valid = bool(
+            left is not None
+            and right is not None
+            and left.get("type") == "line"
+            and right.get("type") == "line"
+            and left_length + 1e-6 >= minimum_side_length
+            and right_length + 1e-6 >= minimum_side_length
+            and direction_error <= 1e-4
+        )
+        reports.append({
+            "point": point.tolist(),
+            "left_segment_length_mm": float(left_length),
+            "right_segment_length_mm": float(right_length),
+            "direction_error_deg": float(direction_error),
+            "left_segment_type": left.get("type") if left else None,
+            "right_segment_type": right.get("type") if right else None,
+            "minimum_side_length_mm": minimum_side_length,
+            "valid": valid,
+        })
+    return {
+        "valid": all(item["valid"] for item in reports),
+        "minimum_side_length_mm": minimum_side_length,
+        "points": reports,
+    }
+
+
+def _endpoint_transition_variants(
+    control: np.ndarray,
+    radius: float,
+    start_direction,
+    goal_direction,
+    protected_points,
+    minimum_straight_mm: float,
+) -> list[np.ndarray]:
+    """Return controls with short endpoint connector points removed.
+
+    The planner deliberately keeps a 30 mm endpoint tangent anchor.  A
+    lattice point immediately after that anchor can be only a few millimetres
+    away, which makes a constant-radius fillet impossible even though the
+    following chord has enough room.  Remove only that first non-protected
+    connector and let the normal line/arc builder validate the resulting
+    chord and collision envelope.  The original control is always retained.
+    """
+    original = remove_close_points(np.asarray(control, dtype=float), 1e-6)
+    variants = [original]
+    protected = [np.asarray(point, dtype=float) for point in (protected_points or [])]
+
+    def is_protected(point) -> bool:
+        return any(dist(point, item) <= 1e-6 for item in protected)
+
+    def corner_needs_trim(points: np.ndarray, index: int) -> bool:
+        if index <= 0 or index >= len(points) - 1:
+            return False
+        if is_protected(points[index]):
+            return False
+        try:
+            # The exact arc angle/sample settings do not affect the fit test.
+            fillet_corner(
+                points[index - 1], points[index], points[index + 1],
+                radius, 180.0, 4.0, minimum_straight_mm,
+            )
+        except UniformBendRadiusError:
+            return True
+        return False
+
+    # Only the first point after the prescribed endpoint anchor is eligible.
+    # This keeps the endpoint direction and all hard waypoints exact.
+    for side, direction in (("start", start_direction), ("goal", goal_direction)):
+        next_variants = []
+        for points in variants:
+            if len(points) < 4:
+                next_variants.append(points)
+                continue
+            index = 2 if side == "start" else len(points) - 3
+            if not corner_needs_trim(points, index):
+                next_variants.append(points)
+                continue
+            if is_protected(points[index]):
+                next_variants.append(points)
+                continue
+            trimmed = np.delete(points, index, axis=0)
+            # Do not alter the endpoint tangent anchor itself.  It remains
+            # exactly the measured direction.  If the configured straight
+            # minimum leaves too little room, extend that anchor along the
+            # prescribed endpoint tangent and let collision checks decide
+            # whether the longer chord is usable in the current component
+            # space.
+            next_variants.extend([points, trimmed])
+            axis = norm(direction)
+            if float(np.linalg.norm(axis)) < 1e-9:
+                continue
+            anchor_index = 1 if side == "start" else len(trimmed) - 2
+            anchor = trimmed[anchor_index]
+            endpoint = trimmed[0] if side == "start" else trimmed[-1]
+            current_length = dist(endpoint, anchor)
+            for length in np.arange(current_length + 1.0, current_length + 121.0, 1.0):
+                extended = trimmed.copy()
+                extended[anchor_index] = (
+                    endpoint + axis * length
+                    if side == "start"
+                    else endpoint - axis * length
+                )
+                check_index = 1 if side == "start" else len(extended) - 2
+                if not corner_needs_trim(extended, check_index):
+                    next_variants.append(extended)
+                    break
+        variants = next_variants
+
+    unique = []
+    for item in variants:
+        if not any(item.shape == other.shape and np.allclose(item, other, atol=1e-7) for other in unique):
+            unique.append(item)
+    return unique
+
+
+def _adaptive_radius_candidates(
+    control: np.ndarray,
+    minimum_radius: float,
+    preferred_radius: float,
+    minimum_straight_mm: float,
+    protected_points,
+    protected_straight_min_mm: float,
+    step_mm: float,
+    large_turn_after_deg: float,
+) -> list[float]:
+    """Build a bounded radius sweep for routes containing a real large turn.
+
+    The upper bound comes from the shortest tangent room at every unprotected
+    corner after the hard-waypoint bridge is inserted.  This keeps the search
+    tied to actual geometry instead of an arbitrary global radius.
+    """
+    base_control = remove_close_points(np.asarray(control, dtype=float), 1e-6)
+    controls = [base_control]
+    protected = [np.asarray(point, dtype=float) for point in (protected_points or [])]
+    # Mirror the endpoint-transition repair used by the main search so the
+    # radius upper bound is computed on the geometry that can actually be
+    # manufactured, rather than on a known short rejected connector.
+    for index in (2, len(base_control) - 3):
+        if 0 < index < len(base_control) - 1 and not any(
+            dist(base_control[index], point) <= 1e-6 for point in protected
+        ):
+            controls.append(np.delete(base_control, index, axis=0))
+    probe_radius = max(float(preferred_radius) * 2.0, float(minimum_radius))
+    controls.extend(
+        _endpoint_transition_variants(
+            base_control,
+            probe_radius,
+            base_control[1] - base_control[0] if len(base_control) > 1 else None,
+            base_control[-1] - base_control[-2] if len(base_control) > 1 else None,
+            protected,
+            minimum_straight_mm,
+        )
+    )
+    caps = []
+    has_large_turn = False
+    for candidate_control in controls:
+        bridge = _insert_hard_waypoint_bridges(
+            candidate_control, protected_points, protected_straight_min_mm
+        )
+        local_caps = []
+        local_large_turn = False
+        for index in range(1, len(bridge) - 1):
+            if any(dist(bridge[index], point) <= 1e-6 for point in protected):
+                continue
+            turn = turn_angle_degrees(bridge[index - 1], bridge[index], bridge[index + 1])
+            if turn > float(large_turn_after_deg):
+                local_large_turn = True
+            tangent = math.tan(math.radians(turn) / 2.0)
+            if tangent > 1e-9:
+                room = min(dist(bridge[index - 1], bridge[index]), dist(bridge[index], bridge[index + 1]))
+                local_caps.append((room - float(minimum_straight_mm)) / tangent)
+        if local_large_turn and local_caps:
+            has_large_turn = True
+            caps.append(min(local_caps))
+    if not has_large_turn or not caps:
+        return []
+    # Each control variant is a complete alternative.  Choose the largest
+    # upper bound among them; the actual build loop still validates every
+    # corner and clearance before accepting it.
+    upper = max(float(minimum_radius), max(caps))
+    step = max(float(step_mm), 0.1)
+    # Keep the configured preferred radius in the sweep even when the rounded
+    # grid would otherwise skip it.
+    values = list(np.arange(float(minimum_radius), upper + step * 0.5, step))
+    values.extend([float(minimum_radius), float(preferred_radius), float(upper)])
+    return sorted({round(value, 6) for value in values if value >= minimum_radius - 1e-9}, reverse=True)
 
 
 def build_line_arc_route(
@@ -761,7 +1121,14 @@ def build_line_arc_route(
     max_arc_deg: float,
     sample_deg: float,
     min_corner_angle_deg: float,
+    protected_points=None,
+    protected_straight_min_mm: float = 15.0,
+    minimum_straight_mm: float = 5.0,
+    allow_large_turn_after_deg: float = 90.0,
 ):
+    guide = _insert_hard_waypoint_bridges(
+        guide, protected_points, protected_straight_min_mm
+    )
     segments = []
     sampled = [guide[0]]
     current = guide[0]
@@ -776,7 +1143,13 @@ def build_line_arc_route(
     for i in range(1, len(guide) - 1):
         included_angle = corner_included_angle_deg(guide[i - 1], guide[i], guide[i + 1])
         min_corner_angle = min(min_corner_angle, included_angle)
-        if included_angle + 1e-6 < required_corner_angle:
+        protected = any(dist(guide[i], point) <= 1e-6 for point in (protected_points or []))
+        physical_turn = turn_angle_degrees(guide[i - 1], guide[i], guide[i + 1])
+        # ``included_angle`` is the supplementary interior angle.  A physical
+        # turn above 90 degrees is an intentional large bend, not a sharp
+        # corner, when its circular fillet and clearance checks pass.
+        large_turn_allowed = physical_turn > float(allow_large_turn_after_deg)
+        if not protected and included_angle + 1e-6 < required_corner_angle and not large_turn_allowed:
             corner_angle_violations.append({
                 "index": int(i),
                 "angle_deg": float(included_angle),
@@ -786,7 +1159,10 @@ def build_line_arc_route(
 
         # 首末锚点也必须圆角，否则 30 mm 方向直线与后续导引线之间会留下尖角。
         # 圆角沿已有端部直线切入，不移动端点，也不改变其切向。
-        fillet = fillet_corner(guide[i - 1], guide[i], guide[i + 1], radius, max_arc_deg, sample_deg)
+        fillet = None if protected else fillet_corner(
+            guide[i - 1], guide[i], guide[i + 1], radius, max_arc_deg, sample_deg,
+            minimum_straight_mm,
+        )
         if fillet is None:
             if dist(current, guide[i]) > 1e-6:
                 segments.append({"type": "line", "start": current.tolist(), "end": guide[i].tolist()})
@@ -814,6 +1190,9 @@ def build_line_arc_route(
         sampled.append(guide[-1])
 
     sampled = np.asarray(sampled, dtype=float)
+    protected_report = validate_hard_waypoint_geometry(
+        segments, protected_points, protected_straight_min_mm
+    )
     return {
         "segments": segments,
         "sampled_path": sampled,
@@ -825,6 +1204,7 @@ def build_line_arc_route(
         "required_min_corner_angle_deg": float(required_corner_angle),
         "corner_angle_valid": len(corner_angle_violations) == 0,
         "corner_angle_violations": corner_angle_violations,
+        "protected_waypoint_geometry": protected_report,
     }
 
 
@@ -872,6 +1252,13 @@ def distance_profile_for_route(space: dict, route: dict, mode: str) -> dict:
     sections = space["sections"]
     xs = np.asarray([s["x"] for s in sections], dtype=float)
     y_max = float(getattr(settings, "DISTANCE_Y_MAX", 40.0))
+    # Use the radius that built this route's swept envelope. Falling back to
+    # the legacy setting keeps old single-route JSON readable, while current
+    # multi-pipe output carries route_max_envelope_radius.
+    route_radius = route.get("route_max_envelope_radius", route.get("pipe_radius"))
+    if route_radius is None:
+        route_radius = getattr(settings, "PIPE_RADIUS", 0.0)
+    route_radius = float(route_radius)
 
     x_values = []
     clearances = []
@@ -881,17 +1268,20 @@ def distance_profile_for_route(space: dict, route: dict, mode: str) -> dict:
         yz = [float(p[1]), float(p[2])]
         best = 1e18
         for comp in comps:
-            best = min(best, distance_to_component_lines(yz, comp) - settings.PIPE_RADIUS)
+            best = min(best, distance_to_component_lines(yz, comp) - route_radius)
         if best >= 1e17:
             clearance = None
         else:
-            clearance = max(0.0, min(float(best), y_max))
+            # Preserve signed clearance so an intersection remains visibly
+            # negative in the HTML diagnostic profile.
+            clearance = min(float(best), y_max)
         x_values.append(float(p[0]))
         clearances.append(clearance)
 
     return {
         "name": route["name"],
         "color": route["color"],
+        "route_envelope_radius": route_radius,
         "x": x_values,
         "clearance": clearances,
     }
@@ -978,7 +1368,20 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     route_name = source_route.get("name", "route")
     guide = np.asarray(source_route["path"], dtype=float)
     guide = remove_close_points(guide, 1e-6)
+    hard_points = [
+        np.asarray(point, dtype=float)
+        for point in params.get("hard_waypoints", source_route.get("hard_waypoints", []))
+    ]
+    hard_names = list(params.get("hard_waypoint_names", source_route.get("hard_waypoint_names", [])))
     constraint_profile = params.get("constraint_profile") or active_constraint_profile()
+    route_start = np.asarray(params.get("start", settings.START), dtype=float)
+    route_goal = np.asarray(params.get("goal", settings.GOAL), dtype=float)
+    route_start_dir = np.asarray(
+        params.get("start_dir", settings.START_DIR_POINT), dtype=float
+    )
+    route_goal_dir = np.asarray(
+        params.get("goal_dir", settings.GOAL_DIR_POINT), dtype=float
+    )
 
     tangent_info = source_route.get("search", {}).get("endpoint_tangency", {})
     start_count = int(tangent_info.get("start", {}).get("curve_point_count", 0))
@@ -1074,10 +1477,14 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
             control = simplify_to_max_points(control, max_turn_count + 2)
         control_before_s_bend = control.copy()
 
-    # 合并内部小角度抖动，保留决定起终点方向的首末控制点。
+    if hard_points:
+        control = preserve_hard_waypoints(control, guide, hard_points)
+
+    # 合并内部小角度抖动，保留决定起终点方向的首末控制点和硬挂点。
     control = merge_small_turns(
         control,
         float(getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0)),
+        preserve_points=hard_points,
     )
     control_before_s_bend = control.copy()
 
@@ -1095,7 +1502,10 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     fallback_control = merge_small_turns(
         remove_close_points(guide, 1e-6),
         float(getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0)),
+        preserve_points=hard_points,
     )
+    if hard_points:
+        fallback_control = preserve_hard_waypoints(fallback_control, guide, hard_points)
     if len(fallback_control) <= max_turn_count + 2 and not np.array_equal(control_options[0], fallback_control):
         control_options.append(fallback_control)
     control_options = [
@@ -1106,36 +1516,82 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     engineered = None
     used_radius = None
     used_control = None
+    radius_search = []
+    radius_candidates = []
     for control_candidate in control_options:
-        for radius in radii:
-            candidate = build_line_arc_route(
+        radius_values = list(radii)
+        adaptive = _adaptive_radius_candidates(
+            control_candidate,
+            minimum_radius,
+            preferred_radius,
+            float(params.get("fillet_min_straight_mm", 5.0)),
+            hard_points,
+            float(params.get("hard_waypoint_min_straight_mm", 15.0)),
+            float(params.get("adaptive_bend_radius_step_mm", 1.0)),
+            float(params.get("allow_large_turn_after_deg", 90.0)),
+        )
+        if adaptive:
+            radius_values = adaptive
+        radius_candidates.extend(float(value) for value in radius_values)
+        for radius in radius_values:
+            radius_search.append(float(radius))
+            transition_controls = _endpoint_transition_variants(
                 control_candidate,
                 radius,
-                params["max_bend_angle_deg"],
-                params["arc_sample_angle_deg"],
-                params["min_corner_angle_deg"],
+                route_start_dir - route_start,
+                route_goal_dir - route_goal,
+                hard_points,
+                float(params.get("fillet_min_straight_mm", 5.0)),
             )
-            collision_report = (
-                joint_validate_path(collision_model, candidate["sampled_path"])
-                if collision_model is not None else None
-            )
-            clearance_ok = collision_report is None or (
-                collision_report["hard_bad_segments"] == 0
-                and (allow_soft or collision_report["soft_bad_segments"] == 0)
-            )
-            geometry_report = validate_engineered_geometry(
-                candidate["segments"], settings.START, settings.GOAL,
-                np.asarray(settings.START_DIR_POINT) - np.asarray(settings.START),
-                np.asarray(settings.GOAL_DIR_POINT) - np.asarray(settings.GOAL),
-            )
-            constraint_report = validate_route_constraints(
-                candidate["sampled_path"], candidate, constraint_profile, collision_model=collision_model,
-            )
-            if (candidate["corner_angle_valid"] and clearance_ok
-                    and constraint_report["valid"] and geometry_report["valid"]):
-                engineered = candidate
-                used_radius = radius
-                used_control = control_candidate
+            for transition_control in transition_controls:
+                try:
+                    candidate = build_line_arc_route(
+                        transition_control,
+                        radius,
+                        params["max_bend_angle_deg"],
+                        params["arc_sample_angle_deg"],
+                        params["min_corner_angle_deg"],
+                        protected_points=hard_points,
+                        protected_straight_min_mm=float(
+                            params.get("hard_waypoint_min_straight_mm", 15.0)
+                        ),
+                        minimum_straight_mm=float(
+                            params.get("fillet_min_straight_mm", 5.0)
+                        ),
+                        allow_large_turn_after_deg=float(
+                            params.get("allow_large_turn_after_deg", 90.0)
+                        ),
+                    )
+                except UniformBendRadiusError:
+                    # A corner that cannot fit this one radius invalidates the
+                    # complete candidate. Try another global radius or the
+                    # endpoint-transition variant; never mix radii.
+                    continue
+                collision_report = (
+                    joint_validate_path(collision_model, candidate["sampled_path"])
+                    if collision_model is not None else None
+                )
+                clearance_ok = collision_report is None or (
+                    collision_report["hard_bad_segments"] == 0
+                    and collision_report.get("inter_pipe_bad_segments", 0) == 0
+                    and (allow_soft or collision_report["soft_bad_segments"] == 0)
+                )
+                geometry_report = validate_engineered_geometry(
+                    candidate["segments"], route_start, route_goal,
+                    route_start_dir - route_start,
+                    route_goal_dir - route_goal,
+                )
+                constraint_report = validate_route_constraints(
+                    candidate["sampled_path"], candidate, constraint_profile, collision_model=collision_model,
+                )
+                if (candidate["corner_angle_valid"] and clearance_ok
+                        and constraint_report["valid"] and geometry_report["valid"]
+                        and candidate["protected_waypoint_geometry"]["valid"]):
+                    engineered = candidate
+                    used_radius = radius
+                    used_control = transition_control
+                    break
+            if engineered is not None:
                 break
         if engineered is not None:
             break
@@ -1152,7 +1608,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     sampled = engineered["sampled_path"]
     tube = tube_mesh(
         sampled,
-        float(getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", constraint_profile["envelope_radius"])),
+        float(params.get("pipe_radius", constraint_profile["envelope_radius"])),
         params["tube_segments"],
     )
     hanger_report = hanger_distance_report(
@@ -1160,18 +1616,30 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         params.get("hanger_points", []),
         params.get("hanger_distance_range", 100.0),
     )
+    hard_report = hard_waypoint_report(sampled, hard_points, hard_names, tolerance=0.0)
+    if not hard_report["all_within_tolerance"]:
+        raise RuntimeError(f"{route_name}: engineered route does not pass every required guardian")
+    hard_conflicts = (
+        hard_conflict_report(collision_model, sampled)
+        if collision_model is not None else
+        {"count": 0, "components": [], "segments": [], "allowed": False}
+    )
 
     return {
         "name": route_name,
+        "pipe_id": params.get("pipe_id"),
+        "start": route_start.tolist(),
+        "goal": route_goal.tolist(),
         "color": color,
         "bend_radius": float(used_radius),
+        # 搜索参考值与最终值分别记录；实际圆弧半径以 bend_radius 为准。
         "requested_bend_radius": float(preferred_radius),
         "active_pipe_spec": constraint_profile["active_spec"],
         "core_spec": constraint_profile["core_spec"],
         "cover_spec": constraint_profile["cover_spec"],
         "pipe_spec_ids": constraint_profile["spec_ids"],
         "core_outer_radius": constraint_profile["core_outer_radius"],
-        "route_max_envelope_radius": float(getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", constraint_profile["envelope_radius"])),
+        "route_max_envelope_radius": float(params.get("pipe_radius", constraint_profile["envelope_radius"])),
         "pipe_segments": constraint_profile["pipe_segments"],
         "max_bend_angle_deg": params["max_bend_angle_deg"],
         "arc_sample_angle_deg": params["arc_sample_angle_deg"],
@@ -1202,14 +1670,129 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "max_turn_angle_deg": engineered["max_turn_angle_deg"],
         "min_corner_angle_deg": engineered["min_corner_angle_deg"],
         "required_min_corner_angle_deg": engineered["required_min_corner_angle_deg"],
+        "fillet_min_straight_mm": float(params.get("fillet_min_straight_mm", 5.0)),
+        "allow_large_turn_after_deg": float(params.get("allow_large_turn_after_deg", 90.0)),
+        "radius_search_mm": sorted({float(value) for value in radius_search}, reverse=True),
+        "radius_candidate_range_mm": sorted({float(value) for value in radius_candidates}, reverse=True),
+        "radius_selection": "largest_feasible_for_large_turn" if radius_search and radius_search[0] > preferred_radius else "preferred_then_minimum",
         "corner_angle_valid": bool(engineered["corner_angle_valid"]),
         "corner_angle_violations": engineered["corner_angle_violations"],
+        "protected_waypoint_geometry": engineered["protected_waypoint_geometry"],
         "constraint_report": constraint_report,
         "geometry_report": geometry_report,
         "collision_report": collision_report,
+        "hard_conflicts": hard_conflicts["segments"],
+        "hard_conflict_components": hard_conflicts["components"],
+        "hard_conflicts_allowed": bool(hard_conflicts["allowed"]),
         "hanger_distance": hanger_report,
         "hanger_valid": bool(hanger_report["all_within_range"]),
+        "hard_waypoints": [point.tolist() for point in hard_points],
+        "hard_waypoint_names": hard_names,
+        "hard_waypoint_report": hard_report,
+        "hard_waypoint_valid": bool(hard_report["all_within_tolerance"]),
     }
+
+
+def make_engineering_params(pipe=None, collision_model=None) -> dict:
+    """Build engineering parameters for the default or one multi-pipe instance.
+
+    The command-line single-pipe path keeps using ``settings.py``.  A
+    multi-pipe caller can provide an object with endpoint and specification
+    attributes without rewriting the global settings file.
+    """
+    def value(name, default=None):
+        if pipe is None:
+            return default
+        if isinstance(pipe, dict):
+            return pipe.get(name, default)
+        return getattr(pipe, name, default)
+
+    spec_id = value("pipe_spec", getattr(settings, "ACTIVE_PIPE_SPEC", ""))
+    radius = value("outer_radius", None)
+    if radius is None:
+        radius = value("radius", None)
+    profile = active_constraint_profile(
+        spec_id=spec_id,
+        envelope_radius=float(radius) if radius is not None else None,
+        pipe_segments=value("pipe_segments", None),
+    )
+    if radius is None:
+        radius = profile["envelope_radius"]
+    required_hangers = value("required_hangers", ())
+    hard_waypoints = []
+    hard_waypoint_names = []
+    for guardian in required_hangers or ():
+        point = guardian.get("point") if isinstance(guardian, dict) else getattr(guardian, "point", None)
+        name = guardian.get("name") if isinstance(guardian, dict) else getattr(guardian, "name", None)
+        if point is None:
+            raise ValueError(f"required guardian {name or '(unnamed)'} has no point")
+        hard_waypoints.append(list(point))
+        hard_waypoint_names.append(str(name or f"GUADIAN_{len(hard_waypoint_names) + 1}"))
+    configured_fillet_straight = float(
+        getattr(settings, "ENGINEERING_FILLET_MIN_STRAIGHT_MM", 5.0)
+    )
+    spec_fillet_straight = profile.get("straight_minimum")
+    fillet_min_straight = max(
+        configured_fillet_straight,
+        float(spec_fillet_straight) if spec_fillet_straight is not None else 0.0,
+    )
+    return {
+        "constraint_profile": profile,
+        "bend_radius": profile["preferred_bend_radius"],
+        "max_bend_angle_deg": float(getattr(settings, "ENGINEERING_MAX_BEND_ANGLE_DEG", 45.0)),
+        "min_corner_angle_deg": float(getattr(settings, "ENGINEERING_MAX_BEND_ANGLE_DEG", 90.0)),
+        "arc_sample_angle_deg": float(getattr(settings, "ENGINEERING_ARC_SAMPLE_ANGLE_DEG", 4.0)),
+        "max_turn_count": int(getattr(settings, "ENGINEERING_MAX_TURN_COUNT", 4)),
+        "min_bend_radius": profile["minimum_bend_radius"],
+        "bend_radius_step": float(getattr(settings, "ENGINEERING_BEND_RADIUS_STEP", 10.0)),
+        "collision_model": collision_model,
+        "simplify_tolerance": float(getattr(settings, "ENGINEERING_SIMPLIFY_TOLERANCE", 25.0)),
+        "z_tolerance": float(getattr(settings, "ENGINEERING_Z_SIMPLIFY_TOLERANCE", 80.0)),
+        "min_segment_length": float(getattr(settings, "ENGINEERING_MIN_SEGMENT_LENGTH", 40.0)),
+        "fillet_min_straight_mm": fillet_min_straight,
+        "allow_large_turn_after_deg": float(
+            getattr(settings, "ENGINEERING_ALLOW_LARGE_TURN_AFTER_DEG", 90.0)
+        ),
+        "adaptive_bend_radius_step_mm": float(
+            getattr(settings, "ENGINEERING_ADAPTIVE_BEND_RADIUS_STEP_MM", 1.0)
+        ),
+        "s_bend_min_turn_deg": float(getattr(settings, "ENGINEERING_S_BEND_MIN_TURN_DEG", 110.0)),
+        "s_bend_max_span": float(getattr(settings, "ENGINEERING_S_BEND_MAX_SPAN", 420.0)),
+        "s_bend_min_detour": float(getattr(settings, "ENGINEERING_S_BEND_MIN_DETOUR", 60.0)),
+        "wiggle_smooth_route_names": set(getattr(settings, "ENGINEERING_WIGGLE_SMOOTH_ROUTE_NAMES", [])),
+        "wiggle_min_turn_deg": float(getattr(settings, "ENGINEERING_WIGGLE_MIN_TURN_DEG", 55.0)),
+        "wiggle_max_span": float(getattr(settings, "ENGINEERING_WIGGLE_MAX_SPAN", 430.0)),
+        "wiggle_min_detour": float(getattr(settings, "ENGINEERING_WIGGLE_MIN_DETOUR", 45.0)),
+        "pipe_radius": float(radius),
+        "tube_segments": int(getattr(settings, "ENGINEERING_TUBE_SEGMENTS", 16)),
+        "hanger_points": value("hanger_points", settings_hanger_points(settings)),
+        "hanger_distance_range": float(value(
+            "hanger_distance_range", getattr(settings, "HANGER_POINT_DISTANCE_RANGE", 100.0)
+        )),
+        "hard_waypoints": hard_waypoints,
+        "hard_waypoint_names": hard_waypoint_names,
+        "hard_waypoint_min_straight_mm": float(
+            getattr(settings, "ENGINEERING_HARD_WAYPOINT_MIN_STRAIGHT_MM", 15.0)
+        ),
+        "pipe_id": value("pipe_id", None),
+        "start": value("start", settings.START),
+        "goal": value("goal", settings.GOAL),
+        "start_dir": value("start_dir", settings.START_DIR_POINT),
+        "goal_dir": value("goal_dir", settings.GOAL_DIR_POINT),
+        "allow_hard_conflicts": bool(value("allow_hard_conflicts", False)),
+    }
+
+
+def engineer_pipe_route(source_route: dict, pipe, color: str, collision_model=None) -> dict:
+    """Engineer one route with a multi-pipe instance's endpoints and radius."""
+    pipe_id = pipe.get("pipe_id") if isinstance(pipe, dict) else getattr(pipe, "pipe_id", "pipe")
+    source = dict(source_route)
+    source_name = str(source_route.get("name", "route"))
+    source["name"] = source_name if source_name.startswith(f"{pipe_id}_") else f"{pipe_id}_{source_name}"
+    params = make_engineering_params(pipe, collision_model=collision_model)
+    result = engineer_route(source, color, params)
+    result["pipe_id"] = str(pipe_id)
+    return result
 
 
 def export_engineering_html(result: dict, output: Path) -> None:
@@ -1444,6 +2027,53 @@ DATA.routes.forEach((route, routeIndex) => {
     marker: { color: route.color, size: 3 },
     visible: false,
   });
+
+  const conflictX = [], conflictY = [], conflictZ = [];
+  const conflictComponents = new Set();
+  for (const conflict of (route.hard_conflicts || [])) {
+    const a = conflict.start || [];
+    const b = conflict.end || [];
+    if (a.length !== 3 || b.length !== 3) continue;
+    conflictX.push(a[0], b[0], null);
+    conflictY.push(a[1], b[1], null);
+    conflictZ.push(a[2], b[2], null);
+    for (const component of (conflict.components || [])) conflictComponents.add(component);
+  }
+  if (conflictX.length) {
+    addRouteTrace(routeIndex, "hardConflicts", {
+      type: "scatter3d",
+      mode: "lines+markers",
+      name: `${route.name} HARD CONFLICT: ${Array.from(conflictComponents).join(", ") || "hard boundary"}`,
+      x: conflictX, y: conflictY, z: conflictZ,
+      line: { color: "#dc2626", width: 12 },
+      marker: { color: "#dc2626", size: 5 },
+      hovertemplate: `${route.name} hard conflict<br>component=${Array.from(conflictComponents).join(", ") || "hard boundary"}<extra></extra>`,
+    });
+  }
+  const interferenceX = [], interferenceY = [], interferenceZ = [], interferenceText = [];
+  const interferencePipes = new Set();
+  for (const conflict of (route.inter_pipe_conflicts || [])) {
+    const a = conflict.closest_point_a || [];
+    const b = conflict.closest_point_b || [];
+    if (a.length !== 3 || b.length !== 3) continue;
+    interferenceX.push(a[0], b[0], null);
+    interferenceY.push(a[1], b[1], null);
+    interferenceZ.push(a[2], b[2], null);
+    interferenceText.push(conflict.minimum_clearance, conflict.minimum_clearance, null);
+    if (conflict.pipe_id_b) interferencePipes.add(conflict.pipe_id_b);
+  }
+  if (interferenceX.length) {
+    addRouteTrace(routeIndex, "interPipeConflicts", {
+      type: "scatter3d",
+      mode: "lines+markers",
+      name: `${route.name} PIPE INTERFERENCE: ${Array.from(interferencePipes).join(", ") || "reserved pipe"}`,
+      x: interferenceX, y: interferenceY, z: interferenceZ,
+      text: interferenceText,
+      line: { color: "#f97316", width: 14 },
+      marker: { color: "#f97316", size: 6, symbol: "x" },
+      hovertemplate: `${route.name} pipe interference<br>with=${Array.from(interferencePipes).join(", ") || "reserved pipe"}<br>minimum clearance=%{text:.2f} mm<extra></extra>`,
+    });
+  }
 });
 
 if (DATA.hanger_points && DATA.hanger_points.length) {
@@ -1484,6 +2114,8 @@ Plotly.newPlot("plot", traces, {
 const SUBITEMS = [
   ["pipe", "Pipe"],
   ["centerline", "Centerline"],
+  ["hardConflicts", "Hard conflicts"],
+  ["interPipeConflicts", "Pipe interference"],
   ["guide", "main2 Guide"],
   ["zGuide", "Z-smoothed Guide"],
   ["control", "Control Points"],
@@ -1491,6 +2123,8 @@ const SUBITEMS = [
 const defaultSubitemVisible = {
   pipe: true,
   centerline: true,
+  hardConflicts: true,
+  interPipeConflicts: true,
   guide: false,
   zGuide: false,
   control: false,
@@ -1640,6 +2274,15 @@ def main() -> None:
         "simplify_tolerance": float(getattr(settings, "ENGINEERING_SIMPLIFY_TOLERANCE", 25.0)),
         "z_tolerance": float(getattr(settings, "ENGINEERING_Z_SIMPLIFY_TOLERANCE", 80.0)),
         "min_segment_length": float(getattr(settings, "ENGINEERING_MIN_SEGMENT_LENGTH", 40.0)),
+        "fillet_min_straight_mm": float(
+            getattr(settings, "ENGINEERING_FILLET_MIN_STRAIGHT_MM", 5.0)
+        ),
+        "allow_large_turn_after_deg": float(
+            getattr(settings, "ENGINEERING_ALLOW_LARGE_TURN_AFTER_DEG", 90.0)
+        ),
+        "adaptive_bend_radius_step_mm": float(
+            getattr(settings, "ENGINEERING_ADAPTIVE_BEND_RADIUS_STEP_MM", 1.0)
+        ),
         "s_bend_min_turn_deg": float(getattr(settings, "ENGINEERING_S_BEND_MIN_TURN_DEG", 110.0)),
         "s_bend_max_span": float(getattr(settings, "ENGINEERING_S_BEND_MAX_SPAN", 420.0)),
         "s_bend_min_detour": float(getattr(settings, "ENGINEERING_S_BEND_MIN_DETOUR", 60.0)),

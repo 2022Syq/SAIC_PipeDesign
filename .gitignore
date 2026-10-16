@@ -1,4 +1,5 @@
 __pycache__/
+.pytest_cache/
 *.py[cod]
 
 # Generated planning and route artifacts
@@ -14,6 +15,7 @@ base/
 upload/ 
 #新的文件夹
 data/input/
+model/
 
 #所有文件
 doc/
@@ -36,6 +38,13 @@ outputs/
 *.docx
 # Temporary Word lock files
 ~$*
+*.tmp
+*.temp
+*.bak
+*.old
+*.swp
+.DS_Store
+Thumbs.db
 
 # Local editor files
 .vscode/

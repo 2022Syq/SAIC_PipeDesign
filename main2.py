@@ -23,7 +23,7 @@ import numpy as np
 
 import settings
 from common_space import html_aspect_ratio, html_x_range, load_json, load_step_meshes_for_html, save_json
-from hanger_utils import hanger_distance_report, settings_hanger_points
+from hanger_utils import hard_waypoint_report, hanger_distance_report, settings_hanger_points
 
 
 def import_shapely():
@@ -462,7 +462,7 @@ def straight_line_clear_ahead(sections: list[dict], section_index: int, current:
             return False, "no_free_point"
         q = np.array([sec["x"], p_free[0], p_free[1]], dtype=float)
         chk = segment_check(sections, current, q)
-        if chk["hard_bad"] > 0:
+        if chk["hard_bad"] > 0 or chk.get("inter_pipe_bad", 0) > 0:
             return False, f"straight_hard={chk['hard_bad']}"
     return True, "straight_clear"
 
@@ -1028,15 +1028,75 @@ def build_bidirectional_route(profile, sections, start, goal, start_dir, goal_di
 class DualSectionModel:
     """Conservative collision model formed by X and Y section families."""
 
-    def __init__(self, x_sections: list[dict], y_sections: list[dict]):
+    def __init__(
+        self,
+        x_sections: list[dict],
+        y_sections: list[dict],
+        allow_hard: bool = False,
+        reserved_routes=None,
+        pipe_radius: float = 0.0,
+        required_clearance: float = 0.0,
+    ):
         if not x_sections or not y_sections:
             raise ValueError("Joint planner requires both x_sections and y_sections; run main1.py again")
         self.x_sections = sorted(x_sections, key=lambda s: s["value"])
         self.y_sections = sorted(y_sections, key=lambda s: s["value"])
         self.x_values = np.asarray([s["value"] for s in self.x_sections], dtype=float)
         self.y_values = np.asarray([s["value"] for s in self.y_sections], dtype=float)
+        # A permissive model is used only for an explicitly authorized pipe.
+        # It still records every original hard-boundary hit for diagnostics.
+        self.allow_hard = bool(allow_hard)
+        self.pipe_radius = float(pipe_radius)
+        self.required_clearance = float(required_clearance)
+        self.reserved_routes = []
+        for item in reserved_routes or ():
+            if isinstance(item, tuple) and len(item) == 2:
+                other_pipe, route = item
+                if isinstance(other_pipe, dict):
+                    other_id = other_pipe.get("pipe_id", "reserved_pipe")
+                    other_radius = other_pipe.get("outer_radius", other_pipe.get("radius", 0.0))
+                else:
+                    other_id = getattr(other_pipe, "pipe_id", "reserved_pipe")
+                    other_radius = getattr(other_pipe, "outer_radius", getattr(other_pipe, "radius", 0.0))
+            elif isinstance(item, dict):
+                route = item.get("route", item)
+                other_id = item.get("pipe_id", "reserved_pipe")
+                other_radius = item.get("radius", item.get("outer_radius", 0.0))
+            else:
+                continue
+            if isinstance(route, dict):
+                path = route.get("engineered_path") or route.get("path")
+            else:
+                path = route
+            if path is None:
+                continue
+            self.reserved_routes.append({
+                "pipe_id": str(other_id),
+                "path": path,
+                "radius": float(other_radius),
+            })
         self._point_status_cache: dict[tuple[float, float, float], tuple[bool, bool, tuple[str, ...]]] = {}
         self._segment_check_cache: dict[tuple, dict] = {}
+
+    def _reserved_clearance_reports(self, a, b, sample_step: float) -> list[dict]:
+        if not self.reserved_routes:
+            return []
+        from route_clearance import check_route_clearance
+
+        candidate = [np.asarray(a, dtype=float).tolist(), np.asarray(b, dtype=float).tolist()]
+        reports = []
+        for reserved in self.reserved_routes:
+            report = check_route_clearance(
+                candidate,
+                self.pipe_radius,
+                reserved["path"],
+                reserved["radius"],
+                self.required_clearance,
+                sample_step=max(float(sample_step), 1.0),
+            )
+            report["pipe_id_b"] = reserved["pipe_id"]
+            reports.append(report)
+        return reports
 
     @staticmethod
     def _nearest_index(values: np.ndarray, value: float) -> int:
@@ -1053,6 +1113,35 @@ class DualSectionModel:
         hard = not point_inside(section, planar)
         soft, soft_name = point_hits_soft_boundary(section, planar)
         return hard, soft, soft_name
+
+    @staticmethod
+    def _hard_component_names(section: dict, point) -> list[str]:
+        """Return the nearest named obstacle at a hard section hit."""
+        planar = DualSectionModel._planar_point(section["axis"], point)
+        distances = []
+        for component in hard_boundary_lines(section):
+            distance = distance_to_lines(planar, component)
+            distances.append((distance, str(component.get("name", "hard_boundary"))))
+        if not distances:
+            return []
+        best = min(distance for distance, _name in distances)
+        return [name for distance, name in distances if distance <= best + 1e-6]
+
+    def hard_components(self, point) -> list[str]:
+        """Return CATIA/IGES component names at a point outside free space."""
+        point = np.asarray(point, dtype=float)
+        names = []
+        for values, sections, axis in (
+            (self.x_values, self.x_sections, "x"),
+            (self.y_values, self.y_sections, "y"),
+        ):
+            index = self._nearest_index(values, point[0 if axis == "x" else 1])
+            section = sections[index]
+            if not point_inside(section, self._planar_point(axis, point)):
+                for name in self._hard_component_names(section, point):
+                    if name not in names:
+                        names.append(name)
+        return names
 
     def point_status(self, point) -> tuple[bool, bool, list[str]]:
         point = np.asarray(point, dtype=float)
@@ -1073,7 +1162,7 @@ class DualSectionModel:
             names.append(x_name or "x_soft_boundary")
         if y_soft:
             names.append(y_name or "y_soft_boundary")
-        result = (bool(x_hard or y_hard), bool(x_soft or y_soft), tuple(names))
+        result = (bool(x_hard or y_hard) and not self.allow_hard, bool(x_soft or y_soft), tuple(names))
         self._point_status_cache[cache_key] = result
         return result[0], result[1], list(result[2])
 
@@ -1118,19 +1207,56 @@ class DualSectionModel:
             unique[tuple(round(float(v), 5) for v in p)] = p
 
         hard_bad = soft_bad = 0
+        hard_points = []
+        hard_components = []
         names = []
         for p in unique.values():
-            hard, soft, point_names = self.point_status(p)
+            xi = self._nearest_index(self.x_values, p[0])
+            yi = self._nearest_index(self.y_values, p[1])
+            x_hard, x_soft, x_name = self._section_status(self.x_sections[xi], p)
+            y_hard, y_soft, y_name = self._section_status(self.y_sections[yi], p)
+            hard = bool(x_hard or y_hard)
+            soft = bool(x_soft or y_soft)
+            point_names = []
+            if x_hard:
+                point_names.append("x_hard_boundary")
+            if y_hard:
+                point_names.append("y_hard_boundary")
+            if x_soft:
+                point_names.append(x_name or "x_soft_boundary")
+            if y_soft:
+                point_names.append(y_name or "y_soft_boundary")
             hard_bad += int(hard)
             soft_bad += int(soft)
             names.extend(point_names)
+            if hard:
+                hard_points.append(p.tolist())
+                # An explicitly authorized hard-conflict model is used inside
+                # A* search.  Component-name distance scans are diagnostics,
+                # not acceptance checks, and are reconstructed after a route
+                # is selected with a strict model.
+                if not self.allow_hard:
+                    for component in self.hard_components(p):
+                        if component not in hard_components:
+                            hard_components.append(component)
+        reserved_reports = self._reserved_clearance_reports(a, b, sample_step)
+        inter_pipe_conflicts = [
+            report for report in reserved_reports if not bool(report.get("valid", False))
+        ]
+        inter_pipe_bad = len(inter_pipe_conflicts)
+        effective_hard_bad = 0 if self.allow_hard else hard_bad
         result = {
-            "valid": hard_bad == 0 and soft_bad == 0,
-            "engineering_valid": hard_bad == 0,
-            "hard_bad": int(hard_bad),
+            "valid": effective_hard_bad == 0 and soft_bad == 0 and inter_pipe_bad == 0,
+            "engineering_valid": effective_hard_bad == 0 and inter_pipe_bad == 0,
+            "hard_bad": int(effective_hard_bad),
+            "hard_bad_original": int(hard_bad),
             "soft_bad": int(soft_bad),
+            "inter_pipe_bad": int(inter_pipe_bad),
+            "inter_pipe_conflicts": inter_pipe_conflicts,
             "total": len(unique),
             "names": names[:8],
+            "hard_conflict_points": hard_points,
+            "hard_components": hard_components,
         }
         self._segment_check_cache[cache_key] = result
         return result
@@ -1138,27 +1264,106 @@ class DualSectionModel:
 
 def joint_validate_path(model: DualSectionModel, path: np.ndarray) -> dict:
     hard_bad_segments = soft_bad_segments = hard_bad_samples = soft_bad_samples = total_samples = 0
+    inter_pipe_bad_segments = inter_pipe_bad_samples = 0
+    inter_pipe_conflicts = []
+    hard_bad_original_segments = hard_bad_original_samples = 0
+    hard_components = []
     for a, b in zip(path[:-1], path[1:]):
         chk = model.segment_check(a, b)
         total_samples += chk["total"]
         hard_bad_segments += int(chk["hard_bad"] > 0)
         soft_bad_segments += int(chk["soft_bad"] > 0)
+        inter_pipe_bad_segments += int(chk.get("inter_pipe_bad", 0) > 0)
+        inter_pipe_bad_samples += int(chk.get("inter_pipe_bad", 0))
         hard_bad_samples += chk["hard_bad"]
         soft_bad_samples += chk["soft_bad"]
+        original = int(chk.get("hard_bad_original", chk["hard_bad"]))
+        hard_bad_original_segments += int(original > 0)
+        hard_bad_original_samples += original
+        for name in chk.get("hard_components", []):
+            if name not in hard_components:
+                hard_components.append(name)
+        for report in chk.get("inter_pipe_conflicts", []):
+            if report not in inter_pipe_conflicts:
+                inter_pipe_conflicts.append(report)
     return {
-        "valid": hard_bad_segments == 0 and soft_bad_segments == 0,
-        "engineering_valid": hard_bad_segments == 0,
+        "valid": hard_bad_segments == 0 and soft_bad_segments == 0 and inter_pipe_bad_segments == 0,
+        "engineering_valid": hard_bad_segments == 0 and inter_pipe_bad_segments == 0,
         "hard_bad_segments": int(hard_bad_segments),
         "soft_bad_segments": int(soft_bad_segments),
         "hard_bad_samples": int(hard_bad_samples),
+        "hard_bad_original_segments": int(hard_bad_original_segments),
+        "hard_bad_original_samples": int(hard_bad_original_samples),
+        "hard_conflict_components": hard_components,
         "soft_bad_samples": int(soft_bad_samples),
+        "inter_pipe_bad_segments": int(inter_pipe_bad_segments),
+        "inter_pipe_bad_samples": int(inter_pipe_bad_samples),
+        "inter_pipe_conflicts": inter_pipe_conflicts,
         "total_samples": int(total_samples),
+    }
+
+
+def hard_conflict_report(model: DualSectionModel, path: np.ndarray) -> dict:
+    """Describe hard-boundary segments, including the component names.
+
+    ``DualSectionModel.allow_hard`` changes acceptance for one authorized pipe,
+    so this report deliberately reads ``hard_bad_original`` and remains visible
+    in JSON/HTML even when planning is allowed to continue.
+    """
+    # Re-run the small final route through a strict model so an allow-listed
+    # search still reports the actual obstacle components it crosses.
+    report_model = model
+    if model.allow_hard:
+        report_model = DualSectionModel(
+            model.x_sections,
+            model.y_sections,
+            allow_hard=False,
+            reserved_routes=model.reserved_routes,
+            pipe_radius=model.pipe_radius,
+            required_clearance=model.required_clearance,
+        )
+    conflicts = []
+    path = np.asarray(path, dtype=float)
+    for index, (a, b) in enumerate(zip(path[:-1], path[1:])):
+        check = report_model.segment_check(a, b)
+        if int(check.get("hard_bad_original", check.get("hard_bad", 0))) <= 0:
+            continue
+        hit_points = [np.asarray(point, dtype=float) for point in check.get("hard_conflict_points", [])]
+        if hit_points:
+            direction = np.asarray(b, dtype=float) - np.asarray(a, dtype=float)
+            length_sq = float(np.dot(direction, direction))
+            hit_points.sort(key=lambda point: float(np.dot(point - np.asarray(a, dtype=float), direction)) / max(length_sq, 1e-12))
+            conflict_start = hit_points[0].tolist()
+            conflict_end = hit_points[-1].tolist()
+        else:
+            conflict_start = a.tolist()
+            conflict_end = b.tolist()
+        conflicts.append({
+            "segment_index": int(index),
+            "start": conflict_start,
+            "end": conflict_end,
+            "segment_start": a.tolist(),
+            "segment_end": b.tolist(),
+            "hard_bad_samples": int(check.get("hard_bad_original", check.get("hard_bad", 0))),
+            "components": list(check.get("hard_components", [])),
+            "names": list(check.get("names", [])),
+        })
+    components = sorted({name for item in conflicts for name in item["components"]})
+    return {
+        "count": len(conflicts),
+        "components": components,
+        "segments": conflicts,
+        "allowed": bool(model.allow_hard and conflicts),
     }
 
 
 def joint_segment_allowed(model: DualSectionModel, a, b, allow_soft: bool) -> tuple[bool, dict]:
     chk = model.segment_check(a, b)
-    allowed = chk["hard_bad"] == 0 and (allow_soft or chk["soft_bad"] == 0)
+    allowed = (
+        chk["hard_bad"] == 0
+        and chk.get("inter_pipe_bad", 0) == 0
+        and (allow_soft or chk["soft_bad"] == 0)
+    )
     return allowed, chk
 
 
@@ -1453,7 +1658,11 @@ def enforce_endpoint_tangency(
     start_error = angle_degrees(with_both[1] - with_both[0], start_direction)
     goal_error = angle_degrees(with_both[-1] - with_both[-2], goal_direction)
     validation = joint_validate_path(model, with_both)
-    if validation["hard_bad_segments"] or (validation["soft_bad_segments"] and not allow_soft):
+    if (
+        validation["hard_bad_segments"]
+        or validation.get("inter_pipe_bad_segments", 0)
+        or (validation["soft_bad_segments"] and not allow_soft)
+    ):
         raise RuntimeError("endpoint tangent transition failed final collision validation")
     return with_both, {
         "required": True,
@@ -1600,7 +1809,7 @@ def joint_astar_path(
                 npnt = node_point(neighbor)
                 edge_cache[edge_key] = model.segment_check(cp, npnt, sample_step=max(SEGMENT_SAMPLE_STEP, 10.0))
             chk = edge_cache[edge_key]
-            if chk["hard_bad"] or (chk["soft_bad"] and not profile.allow_soft):
+            if chk["hard_bad"] or chk.get("inter_pipe_bad", 0) or (chk["soft_bad"] and not profile.allow_soft):
                 continue
 
             npnt = node_point(neighbor)
@@ -1664,7 +1873,11 @@ def joint_astar_path(
     raw = remove_duplicate_points(np.vstack([start, raw_interior, goal]))
     smooth = remove_duplicate_points(np.vstack([start, smooth_interior, goal]))
     validation = joint_validate_path(validation_model, smooth)
-    if validation["hard_bad_segments"] or (validation["soft_bad_segments"] and not profile.allow_soft):
+    if (
+        validation["hard_bad_segments"]
+        or validation.get("inter_pipe_bad_segments", 0)
+        or (validation["soft_bad_segments"] and not profile.allow_soft)
+    ):
         raise RuntimeError("straight endpoint anchor path failed final collision validation")
     tangent_path = smooth
     tangent_info = endpoint_anchor_tangency_info(
@@ -1682,19 +1895,72 @@ def joint_astar_path(
     }
 
 
-def build_joint_route(profile, space, model, start, goal, start_dir, goal_dir, validation_model=None):
+def _insert_hard_waypoints(
+    path: np.ndarray,
+    waypoints: list[np.ndarray],
+    model: DualSectionModel,
+    allow_soft: bool,
+) -> np.ndarray:
+    """Insert required points only where both new chords pass the model."""
+    result = remove_duplicate_points(np.asarray(path, dtype=float))
+    next_segment = 0
+    for waypoint in waypoints:
+        point = np.asarray(waypoint, dtype=float)
+        candidates = []
+        for index in range(next_segment, len(result) - 1):
+            first = result[index]
+            second = result[index + 1]
+            allowed_a, _ = joint_segment_allowed(model, first, point, allow_soft)
+            allowed_b, _ = joint_segment_allowed(model, point, second, allow_soft)
+            if not (allowed_a and allowed_b):
+                continue
+            segment = second - first
+            denominator = float(np.dot(segment, segment))
+            t = 0.0 if denominator <= 1e-12 else float(np.dot(point - first, segment) / denominator)
+            t = max(0.0, min(1.0, t))
+            nearest = first + t * segment
+            candidates.append((float(np.linalg.norm(point - nearest)), index))
+        if not candidates:
+            raise RuntimeError(
+                f"required guardian cannot be connected without collision: {point.tolist()}"
+            )
+        _, index = min(candidates)
+        result = np.vstack([result[: index + 1], point, result[index + 1:]])
+        next_segment = index + 1
+    return remove_duplicate_points(result)
+
+
+def build_joint_route(
+    profile,
+    space,
+    model,
+    start,
+    goal,
+    start_dir,
+    goal_dir,
+    validation_model=None,
+    hard_waypoints=None,
+    hard_waypoint_names=None,
+):
     print(f"\n--- Planning {profile.name} with joint X/Y sections ---")
     validation_model = validation_model or model
     path, search_info = joint_astar_path(
         profile, space, model, start, goal, start_dir, goal_dir,
         validation_model=validation_model,
     )
+    hard_points = [np.asarray(point, dtype=float) for point in (hard_waypoints or [])]
+    if hard_points:
+        path = _insert_hard_waypoints(path, hard_points, validation_model, profile.allow_soft)
     validation = joint_validate_path(validation_model, path)
+    hard_conflicts = hard_conflict_report(validation_model, path)
     hanger_report = hanger_distance_report(
         path,
         settings_hanger_points(settings),
         float(getattr(settings, "HANGER_POINT_DISTANCE_RANGE", 100.0)),
     )
+    hard_report = hard_waypoint_report(path, hard_points, hard_waypoint_names, tolerance=0.0)
+    if not hard_report["all_within_tolerance"]:
+        raise RuntimeError("required guardian was not preserved in the guide route")
     half = max(1, len(path) // 2)
     front_path = path[: half + 1]
     rear_path = path[half:]
@@ -1714,6 +1980,7 @@ def build_joint_route(profile, space, model, start, goal, start_dir, goal_dir, v
             "point": b.tolist(),
             "hard_bad": chk["hard_bad"],
             "soft_bad": chk["soft_bad"],
+            "inter_pipe_bad": chk.get("inter_pipe_bad", 0),
         })
 
     meeting_point = path[half].tolist()
@@ -1748,8 +2015,15 @@ def build_joint_route(profile, space, model, start, goal, start_dir, goal_dir, v
         "point_count": int(len(path)),
         "hanger_distance": hanger_report,
         "hanger_valid": bool(hanger_report["all_within_range"]),
+        "hard_waypoints": [point.tolist() for point in hard_points],
+        "hard_waypoint_names": list(hard_waypoint_names or []),
+        "hard_waypoint_report": hard_report,
+        "hard_waypoint_valid": bool(hard_report["all_within_tolerance"]),
         "search": search_info,
         **validation,
+        "hard_conflicts": hard_conflicts["segments"],
+        "hard_conflict_components": hard_conflicts["components"],
+        "hard_conflicts_allowed": bool(hard_conflicts["allowed"]),
     }
 
 
@@ -1859,6 +2133,17 @@ def export_html(routes: list[dict], output: Path) -> None:
                 "engineering_valid": r["engineering_valid"],
                 "hard_bad_segments": r["hard_bad_segments"],
                 "soft_bad_segments": r["soft_bad_segments"],
+                "allow_hard_conflicts": bool(r.get("allow_hard_conflicts", False)),
+                "hard_conflicts_allowed": bool(r.get("hard_conflicts_allowed", False)),
+                "hard_conflict_components": r.get("hard_conflict_components", []),
+                "hard_conflicts": r.get("hard_conflicts", []),
+                "inter_pipe_conflicts_allowed": bool(r.get("inter_pipe_conflicts_allowed", False)),
+                "inter_pipe_conflicts": r.get("inter_pipe_conflicts", []),
+                "allow_inter_pipe_conflicts": bool(r.get("allow_inter_pipe_conflicts", False)),
+                "point_conflicts": r.get("point_conflicts", []),
+                "channel_report": r.get("channel_report", {}),
+                "diagnostic_only": bool(r.get("diagnostic_only", False)),
+                "reason": r.get("reason"),
                 "hanger_distance": r.get("hanger_distance", {}),
                 "hanger_valid": r.get("hanger_valid", True),
             }
@@ -1973,6 +2258,41 @@ for (let idx = 0; idx < DATA.routes.length; idx++) {
       hoverinfo: "name",
     });
   }
+  for (const conflict of (route.hard_conflicts || [])) {
+    const a = conflict.start || [];
+    const b = conflict.end || [];
+    if (a.length === 3 && b.length === 3) {
+      traces.push({
+        type: "scatter3d",
+        mode: "lines+markers",
+        name: route.name + " HARD CONFLICT: " + ((conflict.components || []).join(", ") || "hard boundary"),
+        x: [a[0], b[0]], y: [a[1], b[1]], z: [a[2], b[2]],
+        line: { color: "#dc2626", width: 12 },
+        marker: { color: "#dc2626", size: 5 },
+        hovertemplate: route.name + " hard conflict<br>component="
+          + ((conflict.components || []).join(", ") || "hard boundary")
+          + "<br>x=%{x:.1f}<br>y=%{y:.1f}<br>z=%{z:.1f}<extra></extra>",
+      });
+    }
+  }
+  for (const conflict of (route.inter_pipe_conflicts || [])) {
+    const a = conflict.closest_point_a || [];
+    const b = conflict.closest_point_b || [];
+    if (a.length === 3 && b.length === 3) {
+      traces.push({
+        type: "scatter3d",
+        mode: "lines+markers",
+        name: route.name + " PIPE INTERFERENCE: " + (conflict.pipe_id_b || "reserved pipe"),
+        x: [a[0], b[0]], y: [a[1], b[1]], z: [a[2], b[2]],
+        line: { color: "#f97316", width: 14 },
+        marker: { color: "#f97316", size: 6, symbol: "x" },
+        hovertemplate: route.name + " pipe interference with "
+          + (conflict.pipe_id_b || "reserved pipe")
+          + "<br>minimum clearance=%{text:.2f} mm<extra></extra>",
+        text: [conflict.minimum_clearance, conflict.minimum_clearance],
+      });
+    }
+  }
 }
 
 if (DATA.hanger_points && DATA.hanger_points.length) {
@@ -2014,6 +2334,151 @@ Plotly.newPlot("plot", traces, {
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html, encoding="utf-8")
     print(f"[HTML] saved: {output}")
+
+
+def plan_pipe_routes(
+    space: dict,
+    pipe=None,
+    reserved_routes=None,
+    allow_hard_conflicts: bool | None = None,
+) -> dict:
+    """Plan one configured pipe against an already-built planning space.
+
+    The legacy ``main()`` entry remains unchanged and still reads the single
+    pipe from ``settings.py``.  Multi-pipe orchestration calls this function
+    with a pipe object so endpoint coordinates are not written back globally.
+    """
+    def value(name, default=None):
+        if pipe is None:
+            return default
+        if isinstance(pipe, dict):
+            return pipe.get(name, default)
+        return getattr(pipe, name, default)
+
+    extra_clearance = float(getattr(settings, "MAIN2_EXTRA_CLEARANCE", 0.0))
+    if not 0.0 <= extra_clearance <= 20.0:
+        raise ValueError("MAIN2_EXTRA_CLEARANCE must be between 0 and 20 mm")
+    x_sections = section_polygons(space, "x", extra_clearance=extra_clearance)
+    y_sections = section_polygons(space, "y", extra_clearance=extra_clearance)
+    if not y_sections:
+        raise RuntimeError("planning space does not contain y_sections")
+    pipe_radius = value("outer_radius", value("radius", getattr(settings, "PIPE_RADIUS", 25.0)))
+    required_clearance = float(value("required_clearance", 0.0) or 0.0)
+    model = DualSectionModel(
+        x_sections,
+        y_sections,
+        reserved_routes=reserved_routes,
+        pipe_radius=pipe_radius,
+        required_clearance=required_clearance,
+    )
+    validation_model = DualSectionModel(
+        section_polygons(space, "x"),
+        section_polygons(space, "y"),
+        reserved_routes=reserved_routes,
+        pipe_radius=pipe_radius,
+        required_clearance=required_clearance,
+    )
+    start = np.asarray(value("start", space.get("start", settings.START)), dtype=float)
+    goal = np.asarray(value("goal", space.get("goal", settings.GOAL)), dtype=float)
+    start_dir_point = np.asarray(value("start_dir", settings.START_DIR_POINT), dtype=float)
+    goal_dir_point = np.asarray(value("goal_dir", settings.GOAL_DIR_POINT), dtype=float)
+    start_dir = norm(start_dir_point - start)
+    goal_dir = norm(goal_dir_point - goal)
+    pipe_id = value("pipe_id", None)
+    pipe_spec = value("pipe_spec", getattr(settings, "ACTIVE_PIPE_SPEC", ""))
+    configured_allow_hard = value("allow_hard_conflicts", False)
+    if allow_hard_conflicts is None:
+        allow_hard_conflicts = configured_allow_hard
+    if not isinstance(allow_hard_conflicts, bool):
+        raise ValueError("allow_hard_conflicts must be a boolean")
+    if allow_hard_conflicts:
+        # Keep the original section geometry, but let this explicitly
+        # authorized pipe pass through hard cells while recording each hit.
+        model = DualSectionModel(
+            x_sections,
+            y_sections,
+            allow_hard=True,
+            reserved_routes=reserved_routes,
+            pipe_radius=pipe_radius,
+            required_clearance=required_clearance,
+        )
+        validation_model = DualSectionModel(
+            section_polygons(space, "x"),
+            section_polygons(space, "y"),
+            allow_hard=True,
+            reserved_routes=reserved_routes,
+            pipe_radius=pipe_radius,
+            required_clearance=required_clearance,
+        )
+    required_hangers = value("required_hangers", ())
+    hard_waypoints = []
+    hard_waypoint_names = []
+    for guardian in required_hangers or ():
+        point = guardian.get("point") if isinstance(guardian, dict) else getattr(guardian, "point", None)
+        name = guardian.get("name") if isinstance(guardian, dict) else getattr(guardian, "name", None)
+        if point is None:
+            raise ValueError(f"required guardian {name or '(unnamed)'} has no point")
+        hard_waypoints.append(np.asarray(point, dtype=float))
+        hard_waypoint_names.append(str(name or f"GUADIAN_{len(hard_waypoint_names) + 1}"))
+
+    routes = []
+    profile_failures = []
+    for profile in make_profiles():
+        try:
+            route = build_joint_route(
+                profile, space, model, start, goal, start_dir, goal_dir,
+                validation_model=validation_model,
+                hard_waypoints=hard_waypoints,
+                hard_waypoint_names=hard_waypoint_names,
+            )
+        except RuntimeError as exc:
+            profile_failures.append({
+                "name": profile.name,
+                "type": type(exc).__name__,
+                "reason": str(exc),
+            })
+            continue
+        route["requested_extra_clearance"] = float(extra_clearance)
+        route["pipe_id"] = pipe_id
+        route["pipe_spec"] = pipe_spec
+        route["pipe_radius"] = float(pipe_radius)
+        route["allow_hard_conflicts"] = bool(allow_hard_conflicts)
+        if pipe_id:
+            route["name"] = f"{pipe_id}_{route['name']}"
+        routes.append(route)
+
+    if not routes:
+        detail = "; ".join(
+            f"{item['name']}: {item['reason']}" for item in profile_failures
+        )
+        requirement = "required guardians" if hard_waypoints else "the planning constraints"
+        raise RuntimeError(
+            f"{pipe_id or 'pipe'}: no route profile satisfies {requirement}"
+            + (f" ({detail})" if detail else "")
+        )
+
+    default_route = routes[0]
+    return {
+        "method": "joint_xy_section_lattice_astar",
+        "pipe_id": pipe_id,
+        "pipe_spec": pipe_spec,
+        "pipe_radius": float(pipe_radius),
+        "allow_hard_conflicts": bool(allow_hard_conflicts),
+        "hard_waypoints": [point.tolist() for point in hard_waypoints],
+        "hard_waypoint_names": hard_waypoint_names,
+        "profile_failures": profile_failures,
+        "space_json": str(space.get("source_json", "")),
+        "path": default_route["path"],
+        "logs": default_route["logs"],
+        "cost": default_route["cost"],
+        "valid_segments": 0 if (
+            default_route["hard_bad_segments"]
+            or default_route["soft_bad_segments"]
+            or default_route.get("inter_pipe_bad_segments", 0)
+        ) else max(0, len(default_route["path"]) - 1),
+        "total_segments": max(0, len(default_route["path"]) - 1),
+        "routes": routes,
+    }
 
 
 def main() -> None:
