@@ -1054,10 +1054,17 @@ class DualSectionModel:
                 other_pipe, route = item
                 if isinstance(other_pipe, dict):
                     other_id = other_pipe.get("pipe_id", "reserved_pipe")
-                    other_radius = other_pipe.get("outer_radius", other_pipe.get("radius", 0.0))
+                    other_radius = other_pipe.get(
+                        "planning_radius",
+                        other_pipe.get("outer_radius", other_pipe.get("radius", 0.0)),
+                    )
                 else:
                     other_id = getattr(other_pipe, "pipe_id", "reserved_pipe")
-                    other_radius = getattr(other_pipe, "outer_radius", getattr(other_pipe, "radius", 0.0))
+                    other_radius = getattr(
+                        other_pipe,
+                        "planning_radius",
+                        getattr(other_pipe, "outer_radius", getattr(other_pipe, "radius", 0.0)),
+                    )
             elif isinstance(item, dict):
                 route = item.get("route", item)
                 other_id = item.get("pipe_id", "reserved_pipe")
@@ -1070,11 +1077,13 @@ class DualSectionModel:
                 path = route
             if path is None:
                 continue
-            self.reserved_routes.append({
-                "pipe_id": str(other_id),
-                "path": path,
-                "radius": float(other_radius),
-            })
+            from route_clearance import component_paths
+            for component in component_paths(route, float(other_radius)):
+                self.reserved_routes.append({
+                    "pipe_id": str(other_id),
+                    "path": component['path'],
+                    "radius": component['radius'],
+                })
         self._point_status_cache: dict[tuple[float, float, float], tuple[bool, bool, tuple[str, ...]]] = {}
         self._segment_check_cache: dict[tuple, dict] = {}
 
@@ -1900,33 +1909,45 @@ def _insert_hard_waypoints(
     waypoints: list[np.ndarray],
     model: DualSectionModel,
     allow_soft: bool,
+    waypoint_normals=None,
 ) -> np.ndarray:
     """Insert required points only where both new chords pass the model."""
     result = remove_duplicate_points(np.asarray(path, dtype=float))
     next_segment = 0
-    for waypoint in waypoints:
+    normals = list(waypoint_normals or [None] * len(waypoints))
+    for waypoint, normal in zip(waypoints, normals):
         point = np.asarray(waypoint, dtype=float)
         candidates = []
         for index in range(next_segment, len(result) - 1):
             first = result[index]
             second = result[index + 1]
-            allowed_a, _ = joint_segment_allowed(model, first, point, allow_soft)
-            allowed_b, _ = joint_segment_allowed(model, point, second, allow_soft)
-            if not (allowed_a and allowed_b):
+            bridge = [point]
+            if normal is not None:
+                axis = norm(np.asarray(normal, dtype=float))
+                direction = second - first
+                direction = direction - float(np.dot(direction, axis)) * axis
+                if float(np.linalg.norm(direction)) < 1e-9:
+                    continue
+                direction = norm(direction)
+                half_length = 2.0 * float(getattr(settings, 'ENGINEERING_HARD_WAYPOINT_MIN_STRAIGHT_MM', 15.0))
+                bridge = [point - direction * half_length, point, point + direction * half_length]
+            chain = [first, *bridge, second]
+            if not all(joint_segment_allowed(model, a, b, allow_soft)[0]
+                       for a, b in zip(chain[:-1], chain[1:])):
                 continue
             segment = second - first
             denominator = float(np.dot(segment, segment))
             t = 0.0 if denominator <= 1e-12 else float(np.dot(point - first, segment) / denominator)
             t = max(0.0, min(1.0, t))
             nearest = first + t * segment
-            candidates.append((float(np.linalg.norm(point - nearest)), index))
+            candidates.append((float(np.linalg.norm(point - nearest)), index, bridge))
         if not candidates:
             raise RuntimeError(
                 f"required guardian cannot be connected without collision: {point.tolist()}"
             )
-        _, index = min(candidates)
-        result = np.vstack([result[: index + 1], point, result[index + 1:]])
-        next_segment = index + 1
+        _, index, bridge = min(candidates, key=lambda item: item[:2])
+        result = np.vstack([result[: index + 1], bridge, result[index + 1:]])
+        next_segment = index + len(bridge)
     return remove_duplicate_points(result)
 
 
@@ -1941,6 +1962,7 @@ def build_joint_route(
     validation_model=None,
     hard_waypoints=None,
     hard_waypoint_names=None,
+    hard_waypoint_normals=None,
 ):
     print(f"\n--- Planning {profile.name} with joint X/Y sections ---")
     validation_model = validation_model or model
@@ -1950,7 +1972,8 @@ def build_joint_route(
     )
     hard_points = [np.asarray(point, dtype=float) for point in (hard_waypoints or [])]
     if hard_points:
-        path = _insert_hard_waypoints(path, hard_points, validation_model, profile.allow_soft)
+        path = _insert_hard_waypoints(path, hard_points, validation_model, profile.allow_soft,
+                                      waypoint_normals=hard_waypoint_normals)
     validation = joint_validate_path(validation_model, path)
     hard_conflicts = hard_conflict_report(validation_model, path)
     hanger_report = hanger_distance_report(
@@ -2362,7 +2385,10 @@ def plan_pipe_routes(
     y_sections = section_polygons(space, "y", extra_clearance=extra_clearance)
     if not y_sections:
         raise RuntimeError("planning space does not contain y_sections")
-    pipe_radius = value("outer_radius", value("radius", getattr(settings, "PIPE_RADIUS", 25.0)))
+    pipe_radius = value(
+        "planning_radius",
+        value("outer_radius", value("radius", getattr(settings, "PIPE_RADIUS", 25.0))),
+    )
     required_clearance = float(value("required_clearance", 0.0) or 0.0)
     model = DualSectionModel(
         x_sections,
@@ -2423,6 +2449,8 @@ def plan_pipe_routes(
 
     routes = []
     profile_failures = []
+    clamp_normals = {item['guardian_name']: item['connector']
+                     for item in value('double_clamp_constraints', ())}
     for profile in make_profiles():
         try:
             route = build_joint_route(
@@ -2430,6 +2458,7 @@ def plan_pipe_routes(
                 validation_model=validation_model,
                 hard_waypoints=hard_waypoints,
                 hard_waypoint_names=hard_waypoint_names,
+                hard_waypoint_normals=[clamp_normals.get(name) for name in hard_waypoint_names],
             )
         except RuntimeError as exc:
             profile_failures.append({

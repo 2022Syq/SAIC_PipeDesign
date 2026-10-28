@@ -63,6 +63,7 @@ def test_pipe_segments_are_preserved_as_local_engineering_metadata():
     )
     assert pipe.pipe_segments[0]["cover_spec"] == "hose_8DE3"
     assert pipe.outer_radius == 7.5
+    assert pipe.planning_radius == 4.5
 
 
 def test_pipe_segments_must_be_objects():
@@ -105,6 +106,32 @@ def test_run_config_validates_ids_and_preserves_priority_order():
 
     with pytest.raises(ValueError, match="unique"):
         RunConfig.from_dict({"pipes": [pipe_data("same"), pipe_data("same")]})
+
+
+def test_double_clamp_resolves_pair_points_and_tangent_connectors():
+    config = RunConfig.from_dict({
+        "pipes": [
+            pipe_data(
+                "A",
+                required_hangers=[{"name": "GA", "point": [0, 0, 0]}],
+            ),
+            pipe_data(
+                "B",
+                required_hangers=[{"name": "GB", "point": [0, 20, 0]}],
+            ),
+        ],
+        "double_clamps": [{
+            "name": "CLAMP_AB",
+            "pipe_a": "A",
+            "guardian_a": "GA",
+            "pipe_b": "B",
+            "guardian_b": "GB",
+            "tangent_tolerance_deg": 4,
+        }],
+    })
+    assert config.double_clamps[0].name == "CLAMP_AB"
+    assert config.pipes[0].double_clamp_constraints[0]["connector"] == (0.0, 20.0, 0.0)
+    assert config.pipes[1].double_clamp_constraints[0]["connector"] == (0.0, -20.0, 0.0)
 
 
 @pytest.mark.parametrize(

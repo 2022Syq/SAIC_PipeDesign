@@ -282,6 +282,14 @@ def _pipe_value(pipe, name, default=None):
     return getattr(pipe, name, default)
 
 
+def _planning_radius(pipe) -> float:
+    """Return the continuous metal-core radius for centerline planning."""
+    value = _pipe_value(pipe, "planning_radius", None)
+    if value is None:
+        value = _pipe_value(pipe, "outer_radius", _pipe_value(pipe, "radius", 0.0))
+    return float(value)
+
+
 def _shared_space_bounds(pipes: list[Any]) -> tuple[list[float], list[float], float]:
     points = [
         list(_pipe_value(pipe, name))
@@ -292,7 +300,7 @@ def _shared_space_bounds(pipes: list[Any]) -> tuple[list[float], list[float], fl
         raise ValueError("at least one pipe is required to build a shared space")
     start = [min(point[index] for point in points) for index in range(3)]
     goal = [max(point[index] for point in points) for index in range(3)]
-    radius = max(float(_pipe_value(pipe, "outer_radius")) for pipe in pipes)
+    radius = max(_planning_radius(pipe) for pipe in pipes)
     return start, goal, radius
 
 
@@ -321,9 +329,9 @@ def _point_conflict_reports(pipes: list[Any]) -> list[dict[str, Any]]:
     """
     reports = []
     for left_index, left_pipe in enumerate(pipes):
-        left_radius = float(_pipe_value(left_pipe, "outer_radius", _pipe_value(left_pipe, "radius", 0.0)))
+        left_radius = _planning_radius(left_pipe)
         for right_pipe in pipes[left_index + 1:]:
-            right_radius = float(_pipe_value(right_pipe, "outer_radius", _pipe_value(right_pipe, "radius", 0.0)))
+            right_radius = _planning_radius(right_pipe)
             for left_name, left_point in _point_entries(left_pipe):
                 for right_name, right_point in _point_entries(right_pipe):
                     distance = float(math.dist(left_point, right_point))
@@ -359,7 +367,7 @@ def _channel_width_report(model: Any, path: Any, pipe: Any) -> dict[str, Any]:
     from shapely.geometry import Point
 
     points = np.asarray(path or [], dtype=float)
-    radius = float(_pipe_value(pipe, "outer_radius", _pipe_value(pipe, "radius", 0.0)))
+    radius = _planning_radius(pipe)
     clearance = float(_pipe_value(pipe, "required_clearance", 0.0) or 0.0)
     required = 2.0 * radius + clearance
     available_values = []
@@ -434,10 +442,62 @@ def _write_pipe_result(pipe_dir: Path, stage: str, result: Any) -> Path:
 def _clearance_against_reserved(pipe, route, reserved, sample_step: float = 20.0) -> list[dict[str, Any]]:
     from route_clearance import check_pipe_clearance
 
-    path = route.get("engineered_path") or route.get("path") or route
     reports = []
     for other_pipe, other_route in reserved:
-        reports.append(check_pipe_clearance(pipe, path, other_pipe, other_route, sample_step))
+        reports.append(check_pipe_clearance(pipe, route, other_pipe, other_route, sample_step))
+    return reports
+
+
+def _double_clamp_reports(config, pipes_by_id, routes_by_id) -> list[dict[str, Any]]:
+    """Evaluate configured two-pipe clamps when both routes are available."""
+    clamps = getattr(config, "double_clamps", ()) or ()
+    if not clamps:
+        return []
+    from route_clearance import double_clamp_report, local_radius_at_point
+
+    reports = []
+    for clamp in clamps:
+        route_a = routes_by_id.get(clamp.pipe_a)
+        route_b = routes_by_id.get(clamp.pipe_b)
+        pipe_a = pipes_by_id.get(clamp.pipe_a)
+        pipe_b = pipes_by_id.get(clamp.pipe_b)
+        if route_a is None or route_b is None or pipe_a is None or pipe_b is None:
+            continue
+        guardian_a = next(
+            (item for item in (_pipe_value(pipe_a, "required_hangers", ()) or ())
+             if (item.get("name") if isinstance(item, Mapping) else getattr(item, "name", None)) == clamp.guardian_a),
+            None,
+        )
+        guardian_b = next(
+            (item for item in (_pipe_value(pipe_b, "required_hangers", ()) or ())
+             if (item.get("name") if isinstance(item, Mapping) else getattr(item, "name", None)) == clamp.guardian_b),
+            None,
+        )
+        if guardian_a is None or guardian_b is None:
+            raise ValueError(f"double clamp {clamp.name} guardian references are not resolved")
+        point_a = guardian_a.get("point") if isinstance(guardian_a, Mapping) else guardian_a.point
+        point_b = guardian_b.get("point") if isinstance(guardian_b, Mapping) else guardian_b.point
+        report = double_clamp_report(
+            route_a,
+            point_a,
+            local_radius_at_point(route_a, point_a, _planning_radius(pipe_a)),
+            route_b,
+            point_b,
+            local_radius_at_point(route_b, point_b, _planning_radius(pipe_b)),
+            tangent_tolerance_deg=float(clamp.tangent_tolerance_deg),
+            required_clearance=max(
+                float(_pipe_value(pipe_a, "required_clearance", 0.0) or 0.0),
+                float(_pipe_value(pipe_b, "required_clearance", 0.0) or 0.0),
+            ),
+        )
+        report.update({
+            "name": clamp.name,
+            "pipe_id_a": clamp.pipe_a,
+            "guardian_a": clamp.guardian_a,
+            "pipe_id_b": clamp.pipe_b,
+            "guardian_b": clamp.guardian_b,
+        })
+        reports.append(report)
     return reports
 
 
@@ -563,7 +623,7 @@ def _direct_guide_engineering(candidate: dict[str, Any], pipe: Any, reason: str)
         "segments": segments,
         "tube_mesh": tube_mesh(
             array_path,
-            float(_pipe_value(pipe, "outer_radius", _pipe_value(pipe, "radius", 0.0))),
+            _planning_radius(pipe),
             int(getattr(settings, "ENGINEERING_TUBE_SEGMENTS", 16)),
         ),
         "guide_length": float(path_length(array_path)),
@@ -666,6 +726,7 @@ def run_multi_pipe(
 
         config = merge_measured_points(config, points_path)
     pipes = _config_pipes(config)
+    pipes_by_id = {_pipe_id(pipe, index): pipe for index, pipe in enumerate(pipes)}
     from main1 import build_shared_space
     from main2 import DualSectionModel, export_html as export_guide_html, plan_pipe_routes, section_polygons
     from main3 import engineer_pipe_route, export_engineering_html
@@ -682,6 +743,7 @@ def run_multi_pipe(
         "pipe_count": len(pipes),
         "planning_order": [_pipe_id(pipe, index) for index, pipe in enumerate(pipes)],
         "points_source": str(Path(points_path).resolve()) if points_path is not None else None,
+        "double_clamps": [asdict(clamp) for clamp in getattr(config, 'double_clamps', ())],
         "shared_space": {
             "start_bound": space_start,
             "goal_bound": space_goal,
@@ -737,7 +799,7 @@ def run_multi_pipe(
                 # can hide a strict solution.
                 collision_kwargs = {
                     "allow_hard": False,
-                    "pipe_radius": float(_pipe_value(pipe, "outer_radius", _pipe_value(pipe, "radius", 0.0))),
+                    "pipe_radius": _planning_radius(pipe),
                     "required_clearance": float(_pipe_value(pipe, "required_clearance", 0.0) or 0.0),
                 }
                 if _accepts_keyword(DualSectionModel, "reserved_routes"):
@@ -820,6 +882,19 @@ def run_multi_pipe(
                     )
                     engineered["inter_pipe_conflicts"] = final_conflicts
                     engineered["inter_pipe_conflicts_allowed"] = False
+                    route_candidates = {
+                        _pipe_id(other_pipe, 0): other_route
+                        for other_pipe, other_route in reserved
+                    }
+                    route_candidates[pipe_id] = engineered
+                    double_reports = _double_clamp_reports(
+                        config, pipes_by_id, route_candidates
+                    )
+                    double_failures = [
+                        item for item in double_reports if not item.get("valid", False)
+                    ]
+                    engineered["double_clamp_reports"] = double_reports
+                    candidate["double_clamp_reports"] = double_reports
                     candidate["inter_pipe_conflicts"] = guide_conflicts
                     candidate["inter_pipe_conflicts_allowed"] = False
                     if diagnostic_engineered is None:
@@ -836,6 +911,7 @@ def run_multi_pipe(
                         and not final_conflicts
                         and not input_point_conflicts
                         and not hard_conflict
+                        and not double_failures
                         and _engineering_is_formally_valid(engineered)
                     )
                     if not formal:
@@ -851,11 +927,12 @@ def run_multi_pipe(
                             if isinstance(engineered.get("geometry_report"), Mapping) else None,
                             "constraint_valid": engineered.get("constraint_report", {}).get("valid")
                             if isinstance(engineered.get("constraint_report"), Mapping) else None,
+                            "double_clamp_reports": double_reports,
                         })
                         continue
                     selected_guide = candidate
                     selected_engineered = engineered
-                    selected_reports = diagnostic_reports
+                    selected_reports = guide_reports + final_reports
                     selected_formal = True
                     selected_engineered["diagnostic_only"] = False
                     selected_engineered["formal_valid"] = True
@@ -872,7 +949,7 @@ def run_multi_pipe(
                             collision_sections[1],
                             allow_hard=True,
                             reserved_routes=reserved,
-                            pipe_radius=float(_pipe_value(pipe, "outer_radius", _pipe_value(pipe, "radius", 0.0))),
+                            pipe_radius=_planning_radius(pipe),
                             required_clearance=float(_pipe_value(pipe, "required_clearance", 0.0) or 0.0),
                         )
                         diagnostic_kwargs = {}
@@ -997,6 +1074,11 @@ def run_multi_pipe(
                 channel_report = selected_engineered.get("channel_report", {})
                 if isinstance(channel_report, Mapping) and float(channel_report.get("gap_mm", 0.0)) < -1e-6:
                     blocking_reasons.append("channel_too_narrow")
+                if any(
+                    not item.get("valid", False)
+                    for item in selected_engineered.get("double_clamp_reports", [])
+                ):
+                    blocking_reasons.append("double_clamp_constraint")
                 if not selected_formal and not blocking_reasons:
                     blocking_reasons.append("engineering_or_constraint_failure")
                 record.update({
@@ -1020,11 +1102,37 @@ def run_multi_pipe(
                     reserved.append((pipe, selected_engineered))
                 _write_json(run_dir / "manifest.json", manifest)
 
+            # A clamp is a shared constraint: neither member is formally accepted
+            # if the other member failed or their final pair fails the clamp check.
+            double_reports = _double_clamp_reports(
+                config, pipes_by_id,
+                {route['pipe_id']: route for route in engineered_routes},
+            )
+            for report in double_reports:
+                pair_ids = {report['pipe_id_a'], report['pipe_id_b']}
+                pair = [route for route in engineered_routes if route['pipe_id'] in pair_ids]
+                report['members_formal_valid'] = all(route.get('formal_valid', False) for route in pair)
+                report['valid'] = report['valid'] and report['members_formal_valid']
+                for route in pair:
+                    route['double_clamp_reports'] = [
+                        item for item in double_reports
+                        if route['pipe_id'] in {item['pipe_id_a'], item['pipe_id_b']}
+                    ]
+                    if not report['valid']:
+                        route.update(formal_valid=False, exportable=False, diagnostic_only=True)
+                        record = next(item for item in manifest['pipes'] if item['pipe_id'] == route['pipe_id'])
+                        record.update(status='diagnostic_failed', formal_valid=False)
+                        if 'double_clamp_constraint' not in record['blocking_reasons']:
+                            record['blocking_reasons'].append('double_clamp_constraint')
+                    _write_pipe_result(run_dir / route['pipe_id'], 'engineering', route)
+            manifest['double_clamp_reports'] = double_reports
+            reserved = [(pipe, route) for pipe, route in reserved if route.get('formal_valid')]
             guide_result = {"run_id": resolved_run_id, "routes": guide_routes}
             engineered_result = {"run_id": resolved_run_id, "routes": engineered_routes}
             _write_json(run_dir / "routes_guide.json", guide_result)
             _write_json(run_dir / "routes_engineered.json", engineered_result)
-            _write_json(run_dir / "validation.json", {"reports": clearance_reports})
+            _write_json(run_dir / "validation.json", {"reports": clearance_reports,
+                                                       "double_clamp_reports": double_reports})
             export_guide_html(guide_routes, run_dir / "routes_guide.html")
             export_engineering_html(engineered_result, run_dir / "multi_route_engineered.html")
 
@@ -1053,7 +1161,7 @@ def run_multi_pipe(
                     create_catia_part(
                         route,
                         output,
-                        float(_pipe_value(pipe, "outer_radius")),
+                        _planning_radius(pipe),
                         bool(catia_visible),
                         bool(centerline_only),
                     )

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -33,6 +33,52 @@ class GuardianPoint:
             raise ValueError("guardian name must be a non-empty string")
         object.__setattr__(self, "name", self.name.strip())
         object.__setattr__(self, "point", _vector(self.point, f"guardians[{self.name}].point"))
+
+
+@dataclass(frozen=True)
+class DoubleClamp:
+    """A two-pipe clamp whose two hanger points define one fixed span."""
+
+    name: str
+    pipe_a: str
+    guardian_a: str
+    pipe_b: str
+    guardian_b: str
+    tangent_tolerance_deg: float = 5.0
+
+    def __post_init__(self) -> None:
+        for field_name in ("name", "pipe_a", "guardian_a", "pipe_b", "guardian_b"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"double_clamps.{field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, value.strip())
+        if self.pipe_a == self.pipe_b:
+            raise ValueError("double clamp must reference two different pipes")
+        tolerance = _number(
+            self.tangent_tolerance_deg,
+            "double_clamps.tangent_tolerance_deg",
+            minimum=0.0,
+        )
+        if tolerance >= 90.0:
+            raise ValueError("double_clamps.tangent_tolerance_deg must be < 90 degrees")
+        object.__setattr__(self, "tangent_tolerance_deg", tolerance)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any], index: int = 0) -> "DoubleClamp":
+        if not isinstance(value, Mapping):
+            raise ValueError(f"double_clamps[{index}] must be an object")
+        required = ("name", "pipe_a", "guardian_a", "pipe_b", "guardian_b")
+        missing = [name for name in required if not value.get(name)]
+        if missing:
+            raise ValueError(f"double_clamps[{index}] missing: {', '.join(missing)}")
+        return cls(
+            name=value["name"],
+            pipe_a=value["pipe_a"],
+            guardian_a=value["guardian_a"],
+            pipe_b=value["pipe_b"],
+            guardian_b=value["guardian_b"],
+            tangent_tolerance_deg=value.get("tangent_tolerance_deg", 5.0),
+        )
 
 
 def _vector(value: Any, field_name: str) -> Vector3:
@@ -161,6 +207,7 @@ class PipeInstance:
     allow_inter_pipe_conflicts: bool = False
     allow_direct_guide_modeling: bool = False
     pipe_segments: tuple[Mapping[str, Any], ...] = ()
+    double_clamp_constraints: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipe_id, str) or not self.pipe_id.strip():
@@ -198,6 +245,15 @@ class PipeInstance:
                 raise ValueError(f"pipe_segments[{index}] must be an object")
             normalized_segments.append(dict(segment))
         object.__setattr__(self, "pipe_segments", tuple(normalized_segments))
+        normalized_clamps = []
+        raw_clamps = self.double_clamp_constraints or ()
+        if isinstance(raw_clamps, (str, bytes, Mapping)) or not isinstance(raw_clamps, Sequence):
+            raise ValueError("double_clamp_constraints must be an array")
+        for index, constraint in enumerate(raw_clamps):
+            if not isinstance(constraint, Mapping):
+                raise ValueError(f"double_clamp_constraints[{index}] must be an object")
+            normalized_clamps.append(dict(constraint))
+        object.__setattr__(self, "double_clamp_constraints", tuple(normalized_clamps))
         if self.start == self.start_dir:
             raise ValueError("start_dir must differ from start")
         if self.goal == self.goal_dir:
@@ -206,9 +262,9 @@ class PipeInstance:
     @property
     def outer_radius(self) -> float:
         radius = spec_outer_radius(self.pipe_spec)
-        # Planning must reserve the largest local envelope as well as the
-        # continuous metal core.  A sleeve uses the configured hose radius;
-        # an explicit radial clearance can enlarge that envelope.
+        # Keep the largest local component envelope for hose/sleeve geometry.
+        # Centerline planning uses ``planning_radius`` so a local hose does
+        # not enlarge every section of the shared route space.
         for segment in self.pipe_segments:
             cover_spec = segment.get("cover_spec")
             if not cover_spec:
@@ -224,6 +280,17 @@ class PipeInstance:
             )
             radius = max(radius, cover_radius + clearance)
         return radius
+
+    @property
+    def planning_radius(self) -> float:
+        """Return the continuous metal-core radius used for route planning.
+
+        Local hose and sleeve envelopes are applied after the centerline has
+        been planned.  Keeping this radius separate lets a local 15 mm hose
+        segment follow a 9 mm metal route without expanding every section of
+        the shared planning space.
+        """
+        return spec_outer_radius(self.pipe_spec)
 
     @property
     def radius(self) -> float:
@@ -255,6 +322,7 @@ class PipeInstance:
             allow_inter_pipe_conflicts=value.get("allow_inter_pipe_conflicts", False),
             allow_direct_guide_modeling=value.get("allow_direct_guide_modeling", False),
             pipe_segments=value.get("pipe_segments", ()),
+            double_clamp_constraints=value.get("double_clamp_constraints", ()),
         )
 
 
@@ -264,6 +332,7 @@ class RunConfig:
 
     pipes: tuple[PipeInstance, ...]
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    double_clamps: tuple[DoubleClamp, ...] = ()
 
     def __post_init__(self) -> None:
         pipes = tuple(self.pipes)
@@ -278,6 +347,15 @@ class RunConfig:
         object.__setattr__(self, "pipes", pipes)
         if not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be a JSON object")
+        clamps = tuple(self.double_clamps)
+        names = [clamp.name for clamp in clamps]
+        if len(set(names)) != len(names):
+            raise ValueError("double clamp names must be unique")
+        pipe_ids = {pipe.pipe_id for pipe in pipes}
+        for clamp in clamps:
+            if clamp.pipe_a not in pipe_ids or clamp.pipe_b not in pipe_ids:
+                raise ValueError(f"double clamp {clamp.name} references an unknown pipe")
+        object.__setattr__(self, "double_clamps", clamps)
 
     def ordered_pipes(self) -> tuple[PipeInstance, ...]:
         """Return pipes in deterministic priority, then input order."""
@@ -298,8 +376,46 @@ class RunConfig:
         if isinstance(raw_pipes, (str, bytes)) or not isinstance(raw_pipes, Sequence):
             raise ValueError("run config 'pipes' must be an array")
         pipes = tuple(PipeInstance.from_dict(item) for item in raw_pipes)
-        metadata = {str(k): v for k, v in value.items() if k != "pipes"}
-        return cls(pipes=pipes, metadata=metadata)
+        raw_clamps = value.get("double_clamps", ())
+        if raw_clamps is None:
+            raw_clamps = ()
+        if isinstance(raw_clamps, (str, bytes, Mapping)) or not isinstance(raw_clamps, Sequence):
+            raise ValueError("double_clamps must be an array")
+        clamps = tuple(DoubleClamp.from_dict(item, index) for index, item in enumerate(raw_clamps))
+        pipe_by_id = {pipe.pipe_id: pipe for pipe in pipes}
+        enriched = {pipe_id: [] for pipe_id in pipe_by_id}
+        for clamp in clamps:
+            if clamp.pipe_a not in pipe_by_id or clamp.pipe_b not in pipe_by_id:
+                raise ValueError(f"double clamp {clamp.name} references an unknown pipe")
+            guardian_a = next((g for g in pipe_by_id[clamp.pipe_a].required_hangers if g.name == clamp.guardian_a), None)
+            guardian_b = next((g for g in pipe_by_id[clamp.pipe_b].required_hangers if g.name == clamp.guardian_b), None)
+            if guardian_a is None or guardian_b is None:
+                raise ValueError(
+                    f"double clamp {clamp.name} must reference each pipe's required_hangers: "
+                    f"{clamp.pipe_a}.{clamp.guardian_a}, {clamp.pipe_b}.{clamp.guardian_b}"
+                )
+            connector = tuple(float(b) - float(a) for a, b in zip(guardian_a.point, guardian_b.point))
+            if math.sqrt(sum(v * v for v in connector)) <= 1e-9:
+                raise ValueError(f"double clamp {clamp.name} points must be different")
+            enriched[clamp.pipe_a].append({
+                "name": clamp.name,
+                "guardian_name": clamp.guardian_a,
+                "other_pipe_id": clamp.pipe_b,
+                "other_guardian_name": clamp.guardian_b,
+                "connector": connector,
+                "tangent_tolerance_deg": clamp.tangent_tolerance_deg,
+            })
+            enriched[clamp.pipe_b].append({
+                "name": clamp.name,
+                "guardian_name": clamp.guardian_b,
+                "other_pipe_id": clamp.pipe_a,
+                "other_guardian_name": clamp.guardian_a,
+                "connector": tuple(-float(v) for v in connector),
+                "tangent_tolerance_deg": clamp.tangent_tolerance_deg,
+            })
+        pipes = tuple(replace(pipe, double_clamp_constraints=tuple(enriched[pipe.pipe_id])) for pipe in pipes)
+        metadata = {str(k): v for k, v in value.items() if k not in {"pipes", "double_clamps"}}
+        return cls(pipes=pipes, metadata=metadata, double_clamps=clamps)
 
 
 def _read_json_payload(path: str | Path, description: str) -> Any:
@@ -464,11 +580,16 @@ def merge_measured_points(config: RunConfig, measured: Mapping[str, Any] | str |
         guardians = pipe.required_hangers
         if guardians:
             resolved = _resolve_required_hangers(
-                [{"name": guardian.name, "point": guardian.point} for guardian in guardians], measured_guardians
+                [{"name": guardian.name, "point": measured_guardians.get(guardian.name, guardian.point)}
+                 for guardian in guardians], measured_guardians
             )
             guardians = tuple(GuardianPoint(entry["name"], entry["point"]) for entry in resolved)
         merged.append(replace(pipe, required_hangers=guardians, **values))
-    return RunConfig(pipes=tuple(merged), metadata=dict(config.metadata))
+    return RunConfig.from_dict({
+        **dict(config.metadata),
+        'pipes': [asdict(pipe) for pipe in merged],
+        'double_clamps': [asdict(clamp) for clamp in config.double_clamps],
+    })
 
 
 read_run_config = load_run_config
@@ -477,6 +598,7 @@ from_json = load_run_config
 
 __all__ = [
     "GuardianPoint",
+    "DoubleClamp",
     "PipeInstance",
     "RunConfig",
     "load_run_config",

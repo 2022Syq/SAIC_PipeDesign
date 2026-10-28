@@ -11,6 +11,7 @@ from multi_pipeline import (
     StageAdapterRequired,
     _channel_width_report,
     _point_conflict_reports,
+    _double_clamp_reports,
     cli_main,
     run_pipeline,
 )
@@ -171,3 +172,30 @@ def test_channel_report_exposes_available_required_and_gap_widths():
     assert report["available_width_mm"] == pytest.approx(20.0)
     assert report["required_width_mm"] == pytest.approx(8.0)
     assert report["gap_mm"] == pytest.approx(12.0)
+
+
+def test_double_clamp_report_keeps_angle_details_and_reads_local_radii():
+    from pipe_config import RunConfig
+    pipes = [{
+        'pipe_id': name, 'start': [0, y, 0], 'goal': [100, y, 0],
+        'start_dir': [10, y, 0], 'goal_dir': [110, y, 0], 'pipe_spec': 'metal_9',
+        'required_hangers': [{'name': 'G' + name, 'point': [50, y, 0]}],
+        'pipe_segments': [{'cover_spec': 'hose_8DE3'}],
+    } for name, y in [('A', 0), ('B', 20)]]
+    config = RunConfig.from_dict({'pipes': pipes, 'double_clamps': [{
+        'name': 'AB', 'pipe_a': 'A', 'pipe_b': 'B', 'guardian_a': 'GA', 'guardian_b': 'GB',
+    }]})
+    report = _double_clamp_reports(config, {p.pipe_id: p for p in config.pipes}, {
+        'A': {'path': [[0, 0, 0], [100, 0, 0]]},
+        'B': {'path': [[0, 20, 0], [100, 20, 0]]},
+    })[0]
+    assert report['valid']
+    assert report['pipe_a']['perpendicular_deviation_deg'] == 0
+    assert report['pipe_id_a'] == 'A'
+    assert report['radius_a_mm'] == 4.5
+
+
+def test_catia_rejects_invalid_double_clamp_before_com(tmp_path):
+    with pytest.raises(ValueError, match='invalid double clamps'):
+        create_catia_part({'double_clamp_reports': [{'valid': False}]},
+                          tmp_path / 'blocked.CATPart', 4.5, False, False)

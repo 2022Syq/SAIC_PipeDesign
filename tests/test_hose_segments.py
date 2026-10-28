@@ -1,5 +1,9 @@
 import math
 import unittest
+from types import SimpleNamespace
+
+import numpy as np
+from shapely.geometry import box
 
 import main3
 from hose_segments import build_hose_layout
@@ -12,6 +16,32 @@ SPECS = {
 
 
 class HoseSegmentTests(unittest.TestCase):
+    def test_hose_slides_away_from_reserved_larger_component(self):
+        # Static space is wide open; only another pipe makes the center invalid.
+        model = SimpleNamespace(
+            x_values=np.array([0.]), y_values=np.array([0.]),
+            x_sections=[{'polys': [box(-1000, -1000, 1000, 1000)]}],
+            y_sections=[{'polys': [box(-1000, -1000, 1000, 1000)]}],
+            required_clearance=0., reserved_routes=[{
+                'path': [[100., 13., 0.], [200., 13., 0.]], 'radius': 7.5,
+            }],
+        )
+        path = np.array([[0., 0., 0.], [300., 0., 0.]])
+        entry = {'core_spec': 'metal_9', 'cover_spec': 'hose_8DE3'}
+        segments = [{'type': 'line', 'start': path[0].tolist(), 'end': path[1].tolist()}]
+        automatic = main3._build_hose_layout_for_route(
+            path, [entry], SPECS, segments, {'pipe_radius': 4.5}, model,
+        )
+        self.assertTrue(automatic['valid'])
+        self.assertTrue(automatic['local_clearance']['valid'])
+        self.assertTrue(any(w['rule'] == 'hose_position_auto_shifted' for w in automatic['warnings']))
+        manual = main3._build_hose_layout_for_route(
+            path, [{**entry, 'position_ratio': .5}], SPECS, segments,
+            {'pipe_radius': 4.5}, model,
+        )
+        self.assertFalse(manual['valid'])
+        self.assertTrue(any(w['rule'] == 'hose_local_clearance' for w in manual['hard_failures']))
+
     def test_component_boundaries_clip_original_line_and_arc_geometry(self):
         segments = [
             {"type": "line", "start": [0, 0, 0], "end": [100, 0, 0]},

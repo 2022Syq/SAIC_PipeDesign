@@ -11,10 +11,9 @@ The workflow has these stages:
 5. `main4.py` creates a CATIA CATPart from one engineered pipe route using line and arc centerline segments.
 6. `main_point.py` measures four CATIA helper points for route endpoint settings.
 
-`pipeline.py` runs `main_point.py`, `main1.py`, `main2.py`, `main3.py`, and
-`main4.py` in that order. The measured CATIA helper points are written to
-`settings.py` before planning starts. Use `--centerline-only` when the final
-CATIA stage should create only the route centerline.
+`multi_pipeline.py` is the canonical entry point for the current four-pipe workflow. It reads the measured-point JSON and multi-pipe configuration, keeps one accepted route per pipe, applies GUADIAN and double-clamp constraints, and writes the route JSON/HTML plus CATIA parts when enabled.
+
+`pipeline.py` remains the legacy single-pipe staged workflow. It is kept for historical comparison and single-route debugging; do not use it for the current four-pipe deliverable. The measured CATIA helper points are written to `settings.py` before the legacy planning stages start. Use `--centerline-only` when the final CATIA stage should create only the route centerline.
 
 ## Project Layout
 
@@ -30,8 +29,11 @@ CATIA stage should create only the route centerline.
 - `main3.py`: engineering pipe reconstruction and final HTML viewer.
 - `main4.py`: CATIA CATPart export for a selected engineered route, preserving the line/arc structure from `main3.py`.
 - `main_point.py`: reads helper points from a CATIA geometrical set and prints `settings.py` endpoint coordinates.
-- `pipeline.py`: runs point measurement, planning-space generation, route search, engineering reconstruction, and CATIA modeling.
+- `multi_pipeline.py`: canonical four-pipe runner with one final route per pipe, GUADIAN/double-clamp acceptance, local hose/sleeve geometry, HTML, and CATIA export.
+- `pipeline.py`: legacy single-pipe staged runner retained for historical comparison.
 - `upload.py`: converts uploaded Part files to IGES files for `main1.py`.
+- `JIAOGUAN_HISTORY.md`: 胶管、双夹具和失败原因的合并迭代记录。
+- `PROJECT_CLEANUP_20261028.md`: 运行产物保留/删除清单和本次整理结果。
 
 ## 本地文件维护规则
 
@@ -39,9 +41,9 @@ CATIA stage should create only the route centerline.
 
 `outputs/<run_id>/` 按运行编号隔离每次多管路结果。运行结束后保留 `manifest.json`、路线/验证 JSON 和需要复盘的诊断文件；`planning_space_checkpoint.json` 只是阶段快照，不能断点续算，完成后可以删除。规划空间 JSON、交互式 HTML 和图片都能由当前代码重新生成，失败或中断的旧运行只保留小型清单与诊断，避免重复占用磁盘。唯一完成运行需要完整保留时，应以其 `manifest.json` 的 `status` 为依据。
 
-当前本地运行结果采用两份代表性记录：保留 `outputs/run_20261001/` 作为旧单管基线，保留 `outputs/run_20261012_multi4_directguide_hard4_fix/` 作为最终多管路版本；其他 run 目录视为迭代产物，清理时可以整体删除。根目录的测点和多管配置 JSON 独立于 run 目录，按后续排障需要保留。
+当前保留四份有明确用途的运行记录：`outputs/run_20261001/` 是旧单管基线，`outputs/run_20261012/` 是双夹具改动前的四管基线，`outputs/run_20261015_pipe3_final/` 是此前 `feat/pipe3` 的参考结果，`outputs/run_20261028_jiaoguan_doubleclamp_4pipes/` 是当前胶管/双夹具正式四管结果。其他失败、重复或中间运行按 `PROJECT_CLEANUP_20261028.md` 清理。根目录的测点、多管配置和双夹具紧凑审计 JSON独立于 run 目录，继续保留。
 
-清理前先执行 `git status --short --branch`，确认没有未提交源码；不要使用 `git clean -xdf`，因为它会连同本地 CAD、模型和运行结果一起删除。清理后使用 `python -m pytest -q`、`python -m py_compile` 和 `git diff --check` 验证代码边界。Git 提交只记录本规则和源码变化，不把本地二进制 CAD 或 `outputs/` 运行产物加入版本库。
+清理前先执行 `git status --short --branch`；不要使用 `git clean -xdf`，因为它会连同本地 CAD、模型和运行结果一起删除。清理后使用 `python -m pytest -q`、OCC Python 的 `py_compile` 和 `git diff --check` 验证代码边界。Git 提交只记录源码、测试和维护文档，不把本地二进制 CAD 或 `outputs/` 运行产物加入版本库。
 
 ## Environment
 
@@ -99,10 +101,11 @@ Read a route's `bend_radius` for its selected radius and
 `requested_bend_radius` for its search reference; `segments[].radius` must
 match the selected radius. The reference value need not match the result.
 
-The planning envelope uses the largest selected outside radius. The current
-active value is `metal_19_05`, so `PIPE_DIAMETER=19.05` mm and
-`PIPE_RADIUS=9.525` mm. A route with local hose segments reserves the largest
-local hose/sleeve envelope as well as the metal core.
+The shared planning envelope uses the continuous metal-core radius. The
+current single-pipe active value is `metal_19_05`, so
+`PIPE_DIAMETER=19.05` mm and `PIPE_RADIUS=9.525` mm. A route with local hose
+segments keeps the hose/sleeve envelope on its assigned component intervals;
+it does not enlarge every section of the metal-core centerline search.
 
 ## Local hose and aluminium sleeves
 
@@ -149,6 +152,44 @@ The outside diameter is the full pipe width; the outside radius is half that
 diameter and is the value used to build each swept envelope. A zero gap allows
 exact tangency, while a negative signed gap means the pipe envelopes intersect
 and the route fails.
+
+### Double clamps
+
+`double_clamps` explicitly identifies a two-pipe clamp. It links one required
+GUADIAN point on each pipe. At both linked points, the local centerline tangent
+must be perpendicular to the line joining the two measured points. The default
+`tangent_tolerance_deg` is 5 degrees. The report also checks the fixed center
+distance against the two local outside radii; it does not replace the ordinary
+route-to-route swept-envelope check.
+
+```json
+{
+  "double_clamps": [{
+    "name": "DOUBLE_CLAMP_PIPE_01_PIPE_02",
+    "pipe_a": "PIPE_01",
+    "guardian_a": "GUADIAN_01#1",
+    "pipe_b": "PIPE_02",
+    "guardian_b": "GUADIAN_02#1",
+    "tangent_tolerance_deg": 5.0
+  }]
+}
+```
+
+The two points are measured centers. For the current pair their distance is
+19.861 mm. With two 15 mm local component envelopes, the center-distance
+clearance is 19.861 - 7.5 - 7.5 = 4.861 mm. This number alone is insufficient
+when the two routes cross the clamp at an oblique angle. For parallel local
+axes with unit tangent `t` and point displacement `d`, the axis distance is
+`sqrt(dot(d,d) - dot(d,t)**2)`. Only when `dot(d,t)=0` does it equal the
+measured point distance. Curved routes still require a separate minimum-distance
+check over the complete component intervals.
+
+Planning checks the larger radii of already reserved hose/sleeve intervals.
+Final pipe-to-pipe acceptance uses each material interval's actual radius,
+instead of treating the entire route as either 9 mm or 15 mm. Automatic hose
+placement also checks reserved pipes; an unresolved local collision is a hard
+failure. R50 bend-radius warnings remain warnings. Both members of an invalid
+double clamp are excluded from formal CATPart export.
 
 ```json
 {
@@ -243,8 +284,7 @@ to `base/`. Existing `.igs` files are kept unless `--overwrite` is used.
 
 `main_point.py` requires CATIA and `pycatia`. By default it reads the geometrical set named `point` from the active CATPart and updates the four active coordinate assignments in `settings.py`. Use `--no-write-settings` for print-only mode, `--documents` to list open CATIA documents, or `--document` to select a specific CATPart.
 
-The `constraint-update` branch records its air-conditioning pipe constraint
-changes in [doc/版本说明-constraint-update.md](doc/版本说明-constraint-update.md).
+The `feat/JIAOGUAN` branch records the current air-conditioning, hose, and clamp constraint changes in [JIAOGUAN_HISTORY.md](JIAOGUAN_HISTORY.md) and [doc/版本说明-JIAOGUAN.md](doc/版本说明-JIAOGUAN.md).
 
 ## Notes
 

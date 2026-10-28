@@ -390,6 +390,10 @@ def create_catia_part(route: dict, output: Path, radius: float, visible: bool, c
         raise ValueError("diagnostic or non-exportable routes cannot generate CATPart")
     if route.get("hard_conflicts") or route.get("inter_pipe_conflicts"):
         raise ValueError("routes with hard or inter-pipe conflicts cannot generate CATPart")
+    if any(not item.get('valid', False) for item in route.get('double_clamp_reports', [])):
+        raise ValueError('routes with invalid double clamps cannot generate CATPart')
+    if route.get('protected_waypoint_geometry', {}).get('valid') is False:
+        raise ValueError('invalid guardian geometry cannot generate CATPart')
     for key in ("geometry_report", "constraint_report"):
         report = route.get(key)
         if isinstance(report, dict) and report.get("valid") is False:

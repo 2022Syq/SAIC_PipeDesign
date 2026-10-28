@@ -57,12 +57,194 @@ def cumulative_lengths(path: np.ndarray) -> np.ndarray:
     return np.asarray(values, dtype=float)
 
 
+def _path_point_at_distance(path: np.ndarray, cumulative: np.ndarray, distance_s: float) -> np.ndarray:
+    """Interpolate one centerline point at an arc-length position."""
+    if len(path) == 0:
+        return np.asarray([], dtype=float)
+    if len(path) == 1:
+        return np.asarray(path[0], dtype=float)
+    target = min(max(float(distance_s), 0.0), float(cumulative[-1]))
+    index = int(np.searchsorted(cumulative, target, side="right") - 1)
+    index = min(max(index, 0), len(path) - 2)
+    start = np.asarray(path[index], dtype=float)
+    end = np.asarray(path[index + 1], dtype=float)
+    span = float(cumulative[index + 1] - cumulative[index])
+    ratio = 0.0 if span <= 1e-9 else (target - float(cumulative[index])) / span
+    return start + ratio * (end - start)
+
+
+def _section_boundary_distance(model: DualSectionModel, point: np.ndarray) -> float:
+    """Return the smallest free-region boundary distance at one path point."""
+    from shapely.geometry import Point
+
+    distances = []
+    for sections, axis_index, planar_indices in (
+        (model.x_sections, 0, (1, 2)),
+        (model.y_sections, 1, (0, 2)),
+    ):
+        values = model.x_values if axis_index == 0 else model.y_values
+        section_index = int(np.argmin(np.abs(values - float(point[axis_index]))))
+        section = sections[section_index]
+        planar = Point(float(point[planar_indices[0]]), float(point[planar_indices[1]]))
+        local = [
+            float(planar.distance(polygon.boundary))
+            for polygon in section.get("polys", [])
+            if polygon.contains(planar) or polygon.touches(planar)
+        ]
+        distances.append(min(local) if local else 0.0)
+    return min(distances) if distances else 0.0
+
+
+def _hose_local_clearance_report(
+    sampled_path: np.ndarray,
+    layout: dict,
+    collision_model: DualSectionModel | None,
+    core_radius: float,
+) -> dict:
+    """Check only local hose/sleeve intervals against the core free space.
+
+    The section polygons already reserve ``core_radius``.  A component with a
+    larger radius therefore needs only the additional radial margin here.
+    This keeps the rest of the route planned as the 9 mm metal tube.
+    """
+    if collision_model is None or not layout.get("enabled"):
+        return {"valid": True, "components": [], "minimum_margin_mm": None}
+    path = np.asarray(sampled_path, dtype=float)
+    cumulative = cumulative_lengths(path)
+    reports = []
+    for index, component in enumerate(layout.get("components", [])):
+        if component.get("kind") not in {"hose", "sleeve"}:
+            continue
+        start_s = float(component.get("start_s", 0.0))
+        end_s = float(component.get("end_s", start_s))
+        sample_count = max(3, int(math.ceil(max(0.0, end_s - start_s) / 5.0)) + 1)
+        sample_s = np.linspace(start_s, end_s, sample_count)
+        required_extra = max(0.0, float(component.get("outer_radius", core_radius)) - float(core_radius))
+        margins = [
+            _section_boundary_distance(collision_model, _path_point_at_distance(path, cumulative, value))
+            - required_extra
+            for value in sample_s
+        ]
+        # The local larger components must also clear already reserved pipes;
+        # static obstacle sections alone cannot detect hose-to-hose overlap.
+        from route_clearance import check_route_clearance
+        local_path = sampled_path_slice(path, start_s, end_s).tolist()
+        pipe_reports = [check_route_clearance(
+            local_path, float(component.get('outer_radius', core_radius)),
+            reserved['path'], reserved['radius'], collision_model.required_clearance,
+        ) for reserved in collision_model.reserved_routes]
+        margins.extend(item['minimum_clearance'] - item['required_clearance'] for item in pipe_reports)
+        reports.append({
+            "index": index,
+            "kind": component.get("kind"),
+            "start_s_mm": start_s,
+            "end_s_mm": end_s,
+            "required_extra_radius_mm": required_extra,
+            "minimum_margin_mm": float(min(margins) if margins else 0.0),
+            "valid": bool(margins and min(margins) >= -1e-6),
+        })
+    minimum_margin = min((item["minimum_margin_mm"] for item in reports), default=None)
+    return {
+        "valid": all(item["valid"] for item in reports),
+        "components": reports,
+        "minimum_margin_mm": minimum_margin,
+    }
+
+
+def _build_hose_layout_for_route(
+    sampled_path: np.ndarray,
+    pipe_segments,
+    specs,
+    engineered_segments,
+    params: dict,
+    collision_model: DualSectionModel | None,
+) -> dict:
+    """Build a local hose layout and slide it if the default center is tight."""
+    length = path_length(sampled_path)
+    defaults = {
+        "default_hose_length_options_mm": tuple(getattr(settings, "HOSE_LENGTH_OPTIONS_MM", (30.0, 75.0))),
+        "default_hose_length_mm": float(getattr(settings, "DEFAULT_HOSE_LENGTH_MM", 30.0)),
+        "default_sleeve_length_mm": float(getattr(settings, "DEFAULT_ALUMINUM_SLEEVE_LENGTH_MM", 30.0)),
+        "default_sleeve_radial_clearance_mm": float(getattr(settings, "DEFAULT_SLEEVE_RADIAL_CLEARANCE_MM", 0.0)),
+    }
+    entries = [dict(item) for item in (pipe_segments or [])]
+
+    def build_at(center_s: float | None = None) -> dict:
+        configured = [dict(item) for item in entries]
+        if center_s is not None and len(configured) == 1:
+            item = configured[0]
+            if item.get("position_s_mm") is None and item.get("position_ratio") is None:
+                item["position_s_mm"] = float(center_s)
+        layout = build_hose_layout(
+            length,
+            configured,
+            specs,
+            engineered_segments,
+            **defaults,
+        )
+        local = _hose_local_clearance_report(
+            sampled_path,
+            layout,
+            collision_model,
+            float(params.get("pipe_radius", 0.0)),
+        )
+        layout["local_clearance"] = local
+        if not local["valid"]:
+            layout['valid'] = False
+            layout.setdefault("hard_failures", []).append({
+                "rule": "hose_local_clearance",
+                "minimum_margin_mm": local["minimum_margin_mm"],
+                "action": "search_position_or_reject",
+            })
+        return layout
+
+    if not entries:
+        return build_at()
+    initial = build_at()
+    if (
+        not initial.get("enabled")
+        or collision_model is None
+        or len(entries) != 1
+        or entries[0].get("position_s_mm") is not None
+        or entries[0].get("position_ratio") is not None
+        or initial.get("local_clearance", {}).get("valid", True)
+    ):
+        return initial
+
+    item = entries[0]
+    hose_length = float(item.get("hose_length_mm", item.get("min_length_mm", defaults["default_hose_length_mm"])))
+    sleeve_length = float(item.get("sleeve_length_mm", defaults["default_sleeve_length_mm"]))
+    half_span = (hose_length + 2.0 * sleeve_length) / 2.0
+    if length < 2.0 * half_span:
+        return initial
+    step = max(5.0, min(10.0, length / 80.0))
+    centers = np.arange(half_span, length - half_span + 1e-6, step)
+    centers = np.unique(np.append(centers, length / 2.0))
+    candidates = [(float(center), build_at(float(center))) for center in centers]
+    best_center, best_layout = max(
+        candidates,
+        key=lambda value: float(value[1]["local_clearance"]["minimum_margin_mm"]),
+    )
+    requested_center = length / 2.0
+    if abs(best_center - requested_center) > 1e-6:
+        best_layout.setdefault("warnings", []).append({
+            "rule": "hose_position_auto_shifted",
+            "requested_center_s_mm": requested_center,
+            "selected_center_s_mm": best_center,
+            "action": "shifted_for_local_clearance",
+        })
+        for component in best_layout.get("components", []):
+            if component.get("position_mode") == "manual_s":
+                component["position_mode"] = "auto_search"
+    return best_layout
+
+
 def active_constraint_profile(spec_id: str | None = None, envelope_radius: float | None = None, pipe_segments=None) -> dict:
     """Resolve the selected air-conditioning pipe rules for this run.
 
-    The planning space still uses one conservative route envelope. Segment
-    assignments are applied along the generated route and use the active
-    metal core until a different core is explicitly configured.
+    Segment assignments are applied along the generated metal-core route.
+    Local hose and sleeve envelopes are carried by the component geometry and
+    do not replace the continuous metal-core planning radius.
     """
     spec_id = str(spec_id or getattr(settings, "ACTIVE_PIPE_SPEC", ""))
     specs = getattr(settings, "PIPE_SPECS", {})
@@ -84,7 +266,7 @@ def active_constraint_profile(spec_id: str | None = None, envelope_radius: float
             raise ValueError(f"Unknown pipe specs: {sorted(unknown)}")
         spec_ids = sorted(spec_ids)
     # 当前运行按一个主动金属规格工程化；局部胶管规格由 hose_layout
-    # 应用到对应的中心线区间，规划包络同时保留最大局部外径。
+    # 应用到对应的中心线区间，中心线路径仍按连续金属芯规划。
     # SAAA 半径是最低要求。recommended 仅作搜索参考，并提升到硬下限；
     # preferred 不限制最终半径上限，大转角搜索可以选用更大的统一半径。
     preferred = max(
@@ -869,6 +1051,7 @@ def _insert_hard_waypoint_bridges(
     guide: np.ndarray,
     protected_points,
     minimum_side_length: float,
+    tangent_directions=None,
 ) -> np.ndarray:
     """Insert a straight bridge through each exact hard waypoint.
 
@@ -886,7 +1069,8 @@ def _insert_hard_waypoint_bridges(
         raise ValueError("hard waypoint minimum straight length must be positive")
     bridge_half_length = 2.0 * minimum_side_length
 
-    for waypoint in protected:
+    tangent_directions = list(tangent_directions or [])
+    for protected_index, waypoint in enumerate(protected):
         distances = np.linalg.norm(points - waypoint, axis=1)
         index = int(np.argmin(distances))
         if float(distances[index]) > 1e-5:
@@ -905,6 +1089,17 @@ def _insert_hard_waypoint_bridges(
         direction = norm(incoming + outgoing)
         if float(np.linalg.norm(incoming + outgoing)) < 1e-9:
             direction = incoming
+        if protected_index < len(tangent_directions) and tangent_directions[protected_index] is not None:
+            normal = norm(np.asarray(tangent_directions[protected_index], dtype=float))
+            projected = direction - float(np.dot(direction, normal)) * normal
+            if float(np.linalg.norm(projected)) < 1e-9:
+                basis = np.asarray([1.0, 0.0, 0.0])
+                if abs(float(np.dot(basis, normal))) > 0.9:
+                    basis = np.asarray([0.0, 1.0, 0.0])
+                projected = np.cross(normal, basis)
+            direction = norm(projected)
+            if float(np.dot(direction, incoming + outgoing)) < 0.0:
+                direction = -direction
 
         left = waypoint - direction * bridge_half_length
         right = waypoint + direction * bridge_half_length
@@ -917,11 +1112,15 @@ def validate_hard_waypoint_geometry(
     segments: list[dict],
     protected_points,
     minimum_side_length: float,
+    tangent_directions=None,
+    tangent_tolerance_deg: float = 5.0,
 ) -> dict:
     """Check the local straight, tangent-continuous bridge at each hard point."""
     minimum_side_length = float(minimum_side_length)
     reports = []
-    for point in (protected_points or []):
+    tangent_directions = list(tangent_directions or [])
+    tangent_tolerance_deg = float(tangent_tolerance_deg)
+    for point_index, point in enumerate(protected_points or []):
         point = np.asarray(point, dtype=float)
         left_indices = [
             index for index, segment in enumerate(segments)
@@ -946,6 +1145,21 @@ def validate_hard_waypoint_geometry(
             direction_error = float(math.degrees(math.acos(max(
                 -1.0, min(1.0, float(np.dot(left_direction, right_direction)))
             ))))
+        tangent_constraint = None
+        tangent_valid = True
+        if point_index < len(tangent_directions) and tangent_directions[point_index] is not None:
+            desired = norm(np.asarray(tangent_directions[point_index], dtype=float))
+            tangent_dot = abs(float(np.dot(left_direction, desired))) if left is not None else 1.0
+            tangent_angle = float(math.degrees(math.acos(max(-1.0, min(1.0, tangent_dot)))))
+            tangent_deviation = abs(90.0 - tangent_angle)
+            tangent_valid = bool(tangent_deviation <= tangent_tolerance_deg + 1e-6)
+            tangent_constraint = {
+                "desired_normal": desired.tolist(),
+                "angle_to_normal_deg": tangent_angle,
+                "perpendicular_deviation_deg": tangent_deviation,
+                "tolerance_deg": tangent_tolerance_deg,
+                "valid": tangent_valid,
+            }
         valid = bool(
             left is not None
             and right is not None
@@ -954,6 +1168,7 @@ def validate_hard_waypoint_geometry(
             and left_length + 1e-6 >= minimum_side_length
             and right_length + 1e-6 >= minimum_side_length
             and direction_error <= 1e-4
+            and tangent_valid
         )
         reports.append({
             "point": point.tolist(),
@@ -963,6 +1178,7 @@ def validate_hard_waypoint_geometry(
             "left_segment_type": left.get("type") if left else None,
             "right_segment_type": right.get("type") if right else None,
             "minimum_side_length_mm": minimum_side_length,
+            "tangent_constraint": tangent_constraint,
             "valid": valid,
         })
     return {
@@ -1070,6 +1286,7 @@ def _adaptive_radius_candidates(
     protected_straight_min_mm: float,
     step_mm: float,
     large_turn_after_deg: float,
+    protected_tangent_directions=None,
 ) -> list[float]:
     """Build a bounded radius sweep for routes containing a real large turn.
 
@@ -1103,7 +1320,10 @@ def _adaptive_radius_candidates(
     has_large_turn = False
     for candidate_control in controls:
         bridge = _insert_hard_waypoint_bridges(
-            candidate_control, protected_points, protected_straight_min_mm
+            candidate_control,
+            protected_points,
+            protected_straight_min_mm,
+            tangent_directions=protected_tangent_directions,
         )
         local_caps = []
         local_large_turn = False
@@ -1144,9 +1364,14 @@ def build_line_arc_route(
     protected_straight_min_mm: float = 15.0,
     minimum_straight_mm: float = 5.0,
     allow_large_turn_after_deg: float = 90.0,
+    protected_tangent_directions=None,
+    protected_tangent_tolerance_deg: float = 5.0,
 ):
     guide = _insert_hard_waypoint_bridges(
-        guide, protected_points, protected_straight_min_mm
+        guide,
+        protected_points,
+        protected_straight_min_mm,
+        tangent_directions=protected_tangent_directions,
     )
     segments = []
     sampled = [guide[0]]
@@ -1210,7 +1435,11 @@ def build_line_arc_route(
 
     sampled = np.asarray(sampled, dtype=float)
     protected_report = validate_hard_waypoint_geometry(
-        segments, protected_points, protected_straight_min_mm
+        segments,
+        protected_points,
+        protected_straight_min_mm,
+        tangent_directions=protected_tangent_directions,
+        tangent_tolerance_deg=protected_tangent_tolerance_deg,
     )
     return {
         "segments": segments,
@@ -1673,6 +1902,7 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
             float(params.get("hard_waypoint_min_straight_mm", 15.0)),
             float(params.get("adaptive_bend_radius_step_mm", 1.0)),
             float(params.get("allow_large_turn_after_deg", 90.0)),
+            params.get("hard_waypoint_tangent_directions"),
         )
         if adaptive:
             radius_values = adaptive
@@ -1705,6 +1935,12 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                         allow_large_turn_after_deg=float(
                             params.get("allow_large_turn_after_deg", 90.0)
                         ),
+                        protected_tangent_directions=params.get(
+                            "hard_waypoint_tangent_directions"
+                        ),
+                        protected_tangent_tolerance_deg=float(
+                            params.get("hard_waypoint_tangent_tolerance_deg", 5.0)
+                        ),
                     )
                 except UniformBendRadiusError:
                     # A corner that cannot fit this one radius invalidates the
@@ -1725,23 +1961,13 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
                     route_start_dir - route_start,
                     route_goal_dir - route_goal,
                 )
-                hose_layout = build_hose_layout(
-                    path_length(candidate["sampled_path"]),
+                hose_layout = _build_hose_layout_for_route(
+                    candidate["sampled_path"],
                     constraint_profile.get("pipe_segments", []),
                     getattr(settings, "PIPE_SPECS", {}),
                     candidate["segments"],
-                    default_hose_length_options_mm=tuple(
-                        getattr(settings, "HOSE_LENGTH_OPTIONS_MM", (30.0, 75.0))
-                    ),
-                    default_hose_length_mm=float(
-                        getattr(settings, "DEFAULT_HOSE_LENGTH_MM", 30.0)
-                    ),
-                    default_sleeve_length_mm=float(
-                        getattr(settings, "DEFAULT_ALUMINUM_SLEEVE_LENGTH_MM", 30.0)
-                    ),
-                    default_sleeve_radial_clearance_mm=float(
-                        getattr(settings, "DEFAULT_SLEEVE_RADIAL_CLEARANCE_MM", 0.0)
-                    ),
+                    params,
+                    collision_model,
                 )
                 constraint_report = validate_route_constraints(
                     candidate["sampled_path"], candidate, constraint_profile,
@@ -1772,15 +1998,13 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
     control_before_s_bend = used_control
     sampled = engineered["sampled_path"]
     if used_hose_layout is None:
-        used_hose_layout = build_hose_layout(
-            path_length(sampled),
+        used_hose_layout = _build_hose_layout_for_route(
+            sampled,
             constraint_profile.get("pipe_segments", []),
             getattr(settings, "PIPE_SPECS", {}),
             engineered["segments"],
-            default_hose_length_options_mm=tuple(getattr(settings, "HOSE_LENGTH_OPTIONS_MM", (30.0, 75.0))),
-            default_hose_length_mm=float(getattr(settings, "DEFAULT_HOSE_LENGTH_MM", 30.0)),
-            default_sleeve_length_mm=float(getattr(settings, "DEFAULT_ALUMINUM_SLEEVE_LENGTH_MM", 30.0)),
-            default_sleeve_radial_clearance_mm=float(getattr(settings, "DEFAULT_SLEEVE_RADIAL_CLEARANCE_MM", 0.0)),
+            params,
+            collision_model,
         )
     component_geometry = build_component_geometry(
         sampled,
@@ -1890,6 +2114,10 @@ def engineer_route(source_route: dict, color: str, params: dict) -> dict:
         "hanger_valid": bool(hanger_report["all_within_range"]),
         "hard_waypoints": [point.tolist() for point in hard_points],
         "hard_waypoint_names": hard_names,
+        "hard_waypoint_tangent_directions": params.get("hard_waypoint_tangent_directions", []),
+        "hard_waypoint_tangent_tolerance_deg": float(
+            params.get("hard_waypoint_tangent_tolerance_deg", 5.0)
+        ),
         "hard_waypoint_report": hard_report,
         "hard_waypoint_valid": bool(hard_report["all_within_tolerance"]),
     }
@@ -1910,7 +2138,7 @@ def make_engineering_params(pipe=None, collision_model=None) -> dict:
         return getattr(pipe, name, default)
 
     spec_id = value("pipe_spec", getattr(settings, "ACTIVE_PIPE_SPEC", ""))
-    radius = value("outer_radius", None)
+    radius = value("planning_radius", value("outer_radius", None))
     if radius is None:
         radius = value("radius", None)
     profile = active_constraint_profile(
@@ -1930,6 +2158,20 @@ def make_engineering_params(pipe=None, collision_model=None) -> dict:
             raise ValueError(f"required guardian {name or '(unnamed)'} has no point")
         hard_waypoints.append(list(point))
         hard_waypoint_names.append(str(name or f"GUADIAN_{len(hard_waypoint_names) + 1}"))
+    tangent_by_guardian = {
+        str(item.get("guardian_name")): item
+        for item in (value("double_clamp_constraints", ()) or ())
+        if isinstance(item, dict) and item.get("guardian_name")
+    }
+    hard_waypoint_tangent_directions = [
+        tangent_by_guardian.get(name, {}).get("connector")
+        for name in hard_waypoint_names
+    ]
+    tangent_tolerances = [
+        float(tangent_by_guardian[name].get("tangent_tolerance_deg", 5.0))
+        for name in hard_waypoint_names
+        if name in tangent_by_guardian
+    ]
     configured_fillet_straight = float(
         getattr(settings, "ENGINEERING_FILLET_MIN_STRAIGHT_MM", 5.0)
     )
@@ -1973,6 +2215,8 @@ def make_engineering_params(pipe=None, collision_model=None) -> dict:
         )),
         "hard_waypoints": hard_waypoints,
         "hard_waypoint_names": hard_waypoint_names,
+        "hard_waypoint_tangent_directions": hard_waypoint_tangent_directions,
+        "hard_waypoint_tangent_tolerance_deg": min(tangent_tolerances or [5.0]),
         "hard_waypoint_min_straight_mm": float(
             getattr(settings, "ENGINEERING_HARD_WAYPOINT_MIN_STRAIGHT_MM", 15.0)
         ),

@@ -206,9 +206,138 @@ def check_pipe_clearance(
     if not isinstance(pipe_a, PipeInstance) or not isinstance(pipe_b, PipeInstance):
         raise TypeError("check_pipe_clearance expects two PipeInstance values")
     required = max(pipe_a.required_clearance, pipe_b.required_clearance)
-    report = check_route_clearance(route_a, pipe_a.outer_radius, route_b, pipe_b.outer_radius, required, sample_step)
+    reports = []
+    for part_a in component_paths(route_a, pipe_a.planning_radius):
+        for part_b in component_paths(route_b, pipe_b.planning_radius):
+            item = check_route_clearance(
+                part_a['path'], part_a['radius'], part_b['path'], part_b['radius'],
+                required, sample_step,
+            )
+            item.update(component_a=part_a['kind'], component_b=part_b['kind'])
+            reports.append(item)
+    report = min(reports, key=lambda item: item['minimum_clearance'])
+    report['envelope_mode'] = 'local_components'
     report.update({"pipe_id_a": pipe_a.pipe_id, "pipe_id_b": pipe_b.pipe_id})
     return report
+
+
+def component_paths(route: Any, core_radius: float) -> list[dict]:
+    """Split the sampled centerline at material boundaries without expanding metal intervals."""
+    points = np.asarray(_path_value(route), dtype=float)
+    components = route.get('component_segments', []) if isinstance(route, Mapping) else []
+    if not components:
+        return [{'path': points.tolist(), 'radius': core_radius, 'kind': 'aluminum'}]
+    lengths = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    def point_at(s):
+        return [float(np.interp(s, lengths, points[:, axis])) for axis in range(3)]
+    result = []
+    for item in components:
+        lo, hi = float(item['start_s']), float(item['end_s'])
+        if hi <= lo:
+            continue
+        interior = points[(lengths > lo) & (lengths < hi)].tolist()
+        result.append({'path': [point_at(lo), *interior, point_at(hi)],
+                       'radius': float(item['outer_radius']), 'kind': item['kind']})
+    return result
+
+
+def local_radius_at_point(route: Any, point: Any, core_radius: float) -> float:
+    """Read the radius of the closest material interval (larger radius at a shared boundary)."""
+    entries = []
+    for item in component_paths(route, core_radius):
+        report = path_tangent_at_point(item['path'], point)
+        entries.append((report['distance_to_route_mm'], item['radius']))
+    nearest = min(distance for distance, _ in entries)
+    return max(radius for distance, radius in entries if distance <= nearest + 1e-6)
+
+
+def path_tangent_at_point(path: Any, point: Any, tolerance: float = 1e-6) -> dict[str, Any]:
+    """Return the local centerline tangent at the closest point on a route."""
+    points = list(_path_value(path))
+    target = _point(point, "point")
+    if len(points) < 2:
+        raise ValueError("route must contain at least two points")
+    best = None
+    for index, (left, right) in enumerate(_segments(points)):
+        direction = right - left
+        length_sq = float(np.dot(direction, direction))
+        if length_sq <= 1e-12:
+            continue
+        ratio = max(0.0, min(1.0, float(np.dot(target - left, direction) / length_sq)))
+        witness = left + ratio * direction
+        distance = float(np.linalg.norm(target - witness))
+        if best is None or distance < best[0]:
+            best = (distance, index, ratio, direction / math.sqrt(length_sq), witness)
+    if best is None:
+        raise ValueError("route contains no non-zero segment")
+    distance, index, ratio, tangent, witness = best
+    return {
+        "distance_to_route_mm": distance,
+        "segment_index": int(index),
+        "segment_ratio": float(ratio),
+        "tangent": [float(value) for value in tangent],
+        "point": [float(value) for value in witness],
+        "within_tolerance": bool(distance <= float(tolerance)),
+    }
+
+
+def double_clamp_report(
+    route_a: Any,
+    point_a: Any,
+    radius_a: float,
+    route_b: Any,
+    point_b: Any,
+    radius_b: float,
+    tangent_tolerance_deg: float = 5.0,
+    required_clearance: float = 0.0,
+) -> dict[str, Any]:
+    """Check fixed two-pipe clamp spacing and perpendicular local tangents."""
+    from math import acos, degrees
+
+    a = _point(point_a, "point_a")
+    b = _point(point_b, "point_b")
+    connector = b - a
+    connector_length = float(np.linalg.norm(connector))
+    if connector_length <= 1e-9:
+        raise ValueError("double clamp points must be different")
+    connector_unit = connector / connector_length
+    tangent_a = path_tangent_at_point(route_a, a)
+    tangent_b = path_tangent_at_point(route_b, b)
+    dot_a = abs(float(np.dot(np.asarray(tangent_a["tangent"]), connector_unit)))
+    dot_b = abs(float(np.dot(np.asarray(tangent_b["tangent"]), connector_unit)))
+    angle_a = degrees(acos(max(-1.0, min(1.0, dot_a))))
+    angle_b = degrees(acos(max(-1.0, min(1.0, dot_b))))
+    deviation_a = abs(90.0 - angle_a)
+    deviation_b = abs(90.0 - angle_b)
+    minimum_clearance = connector_length - float(radius_a) - float(radius_b)
+    tolerance = float(tangent_tolerance_deg)
+    valid = bool(
+        tangent_a["within_tolerance"]
+        and tangent_b["within_tolerance"]
+        and deviation_a <= tolerance + 1e-6
+        and deviation_b <= tolerance + 1e-6
+        and minimum_clearance >= float(required_clearance) - 1e-6
+    )
+    return {
+        "connector": [float(value) for value in connector_unit],
+        "center_distance_mm": connector_length,
+        "radius_a_mm": float(radius_a),
+        "radius_b_mm": float(radius_b),
+        "minimum_clearance_mm": minimum_clearance,
+        "required_clearance_mm": float(required_clearance),
+        "tangent_tolerance_deg": tolerance,
+        "pipe_a": {
+            **tangent_a,
+            "angle_to_connector_deg": angle_a,
+            "perpendicular_deviation_deg": deviation_a,
+        },
+        "pipe_b": {
+            **tangent_b,
+            "angle_to_connector_deg": angle_b,
+            "perpendicular_deviation_deg": deviation_b,
+        },
+        "valid": valid,
+    }
 
 
 minimum_swept_clearance = check_route_clearance
@@ -221,6 +350,8 @@ __all__ = [
     "minimum_centerline_distance",
     "check_route_clearance",
     "check_pipe_clearance",
+    "path_tangent_at_point",
+    "double_clamp_report",
     "minimum_swept_clearance",
     "swept_envelope_clearance",
 ]

@@ -84,6 +84,34 @@ class EngineeringGeometryTests(unittest.TestCase):
                 protected_points=[self.guide[0]],
             )
 
+    def test_double_clamp_tangent_forces_bridge_perpendicular_to_connector(self):
+        guide = np.asarray([
+            [0.0, 0.0, 0.0], [0.0, 40.0, 0.0], [0.0, 100.0, 0.0],
+        ])
+        waypoint = guide[1]
+        route = main3.build_line_arc_route(
+            guide,
+            15.0,
+            90,
+            4,
+            90,
+            protected_points=[waypoint],
+            protected_straight_min_mm=15,
+            protected_tangent_directions=[[1.0, 0.0, 0.0]],
+            protected_tangent_tolerance_deg=1.0,
+        )
+        report = route["protected_waypoint_geometry"]
+        self.assertTrue(report["valid"], report)
+        self.assertTrue(report["points"][0]["tangent_constraint"]["valid"])
+
+    def test_double_clamp_projection_changes_oblique_bridge(self):
+        guide = np.asarray([[-100., -60., 0.], [0., 0., 0.], [100., 60., 0.]])
+        bridge = main3._insert_hard_waypoint_bridges(
+            guide, [guide[1]], 15, tangent_directions=[[0., 1., 0.]],
+        )
+        np.testing.assert_allclose(bridge[1], [-30, 0, 0])
+        np.testing.assert_allclose(bridge[3], [30, 0, 0])
+
     def test_joint_gap_and_changed_endpoint_are_rejected(self):
         segments = copy.deepcopy(self.build()["segments"])
         segments[1]["start"][2] += 0.1
