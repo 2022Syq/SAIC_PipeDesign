@@ -382,19 +382,24 @@ def save_part_document(catia, part_doc, output: Path) -> Path:
     raise RuntimeError(f"CATIA SaveAs failed for all output paths: {last_error}")
 
 
-def create_catia_part(route: dict, output: Path, radius: float, visible: bool, centerline_only: bool) -> None:
-    # CATIA is the final export boundary. A route explicitly marked as a
-    # diagnostic or carrying collision evidence must never be turned into a
-    # formal CATPart, even when this function is called directly.
-    if route.get("diagnostic_only") or route.get("formal_valid") is False or route.get("exportable") is False:
+def create_catia_part(route: dict, output: Path, radius: float, visible: bool, centerline_only: bool,
+                      *, allow_constraint_warnings: bool = False) -> Path:
+    # Default planner exports require formal acceptance. The manual workbench
+    # may explicitly export constraint warnings, while retaining those reports.
+    # The engineering UI explicitly permits exporting constraint warnings. Keep
+    # the actual reports intact; diagnostics and invalid CAD geometry still fail.
+    if route.get("diagnostic_only") or (not allow_constraint_warnings and (
+            route.get("formal_valid") is False or route.get("exportable") is False)):
         raise ValueError("diagnostic or non-exportable routes cannot generate CATPart")
-    if route.get("hard_conflicts") or route.get("inter_pipe_conflicts"):
+    if not allow_constraint_warnings and (route.get("hard_conflicts") or route.get("inter_pipe_conflicts")):
         raise ValueError("routes with hard or inter-pipe conflicts cannot generate CATPart")
-    if any(not item.get('valid', False) for item in route.get('double_clamp_reports', [])):
+    if not allow_constraint_warnings and any(not item.get('valid', False) for item in route.get('double_clamp_reports', [])):
         raise ValueError('routes with invalid double clamps cannot generate CATPart')
     if route.get('protected_waypoint_geometry', {}).get('valid') is False:
         raise ValueError('invalid guardian geometry cannot generate CATPart')
     for key in ("geometry_report", "constraint_report"):
+        if key == "constraint_report" and allow_constraint_warnings:
+            continue
         report = route.get(key)
         if isinstance(report, dict) and report.get("valid") is False:
             raise ValueError(f"route {key} is invalid; CATPart export is blocked")
@@ -494,7 +499,7 @@ def create_catia_part(route: dict, output: Path, radius: float, visible: bool, c
                     "the CATPart was not saved"
                 ) from exc
 
-    save_part_document(catia, part_doc, output)
+    return save_part_document(catia, part_doc, output)
 
 
 def main() -> None:

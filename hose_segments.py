@@ -98,6 +98,7 @@ def build_hose_layout(
     default_hose_length_mm: float = DEFAULT_HOSE_LENGTH_MM,
     default_sleeve_length_mm: float = DEFAULT_SLEEVE_LENGTH_MM,
     default_sleeve_radial_clearance_mm: float = 0.0,
+    allow_constraint_warnings: bool = False,
 ) -> dict[str, Any]:
     """Resolve optional hose/sleeve intervals and their constraint report.
 
@@ -144,7 +145,10 @@ def build_hose_layout(
             raise ValueError(
                 f"PIPE_SEGMENTS[{index}].min_length_mm must be one of {allowed_options} mm"
             )
-        hose_length = _number(raw.get("hose_length_mm", minimum_length), f"PIPE_SEGMENTS[{index}].hose_length_mm", minimum=minimum_length)
+        hose_length = _number(raw.get("hose_length_mm", minimum_length), f"PIPE_SEGMENTS[{index}].hose_length_mm",
+                              minimum=1e-6 if allow_constraint_warnings else minimum_length)
+        if hose_length < minimum_length:
+            hard_failures.append({"rule": "hose_length", "actual_mm": hose_length, "minimum_mm": minimum_length})
         sleeve_length = _number(raw.get("sleeve_length_mm", default_sleeve_length_mm), f"PIPE_SEGMENTS[{index}].sleeve_length_mm", minimum=1e-6)
         minimum_radius = _number(
             raw.get("minimum_bend_radius_mm", hose.get("minimum_bend_radius", 0.0)),
@@ -152,6 +156,10 @@ def build_hose_layout(
             minimum=0.0,
         )
         total_span = hose_length + 2.0 * sleeve_length
+        # Manual edits must retain the requested material layout. Never silently
+        # replace an overlong hose with metal or move it away from the user target.
+        if allow_constraint_warnings and total_span > path_length + 1e-6:
+            raise ValueError("路线长度不足以容纳胶管和两端铝套，未接受此次修改")
         if total_span > path_length + 1e-7:
             warnings.append({
                 "rule": "hose_total_span",
@@ -189,6 +197,8 @@ def build_hose_layout(
         half_span = total_span / 2.0
         requested_center = hose_center
         preferred_center = min(max(hose_center, half_span), path_length - half_span)
+        if allow_constraint_warnings and abs(preferred_center - hose_center) > 1e-6:
+            raise ValueError("胶管或铝套超出路线端部，未接受此次修改")
         position_adjusted = abs(preferred_center - requested_center) > 1e-7
         if position_mode != "center" and abs(requested_center - preferred_center) > 1e-7:
             warnings.append({

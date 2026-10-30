@@ -125,16 +125,38 @@ def _segments(points: list[list[float]]) -> list[tuple[np.ndarray, np.ndarray]]:
     return list(zip(values[:-1], values[1:]))
 
 
-def minimum_centerline_distance(path_a: Any, path_b: Any, sample_step: float = 20.0) -> dict[str, Any]:
-    """Find the minimum distance between two sampled centerline polylines."""
-    sampled_a = sample_route(path_a, sample_step)
-    sampled_b = sample_route(path_b, sample_step)
+def _prepare_sampled_segments(sampled_b: list[list[float]]):
+    b_segments = _segments(sampled_b)
+    b_starts = np.asarray([segment[0] for segment in b_segments], dtype=float)
+    b_ends = np.asarray([segment[1] for segment in b_segments], dtype=float)
+    return b_segments, np.minimum(b_starts, b_ends), np.maximum(b_starts, b_ends)
+
+
+def _minimum_centerline_distance_sampled(
+    sampled_a: list[list[float]],
+    sampled_b: list[list[float]],
+    prepared_b=None,
+) -> dict[str, Any]:
+    """Find the minimum distance when both paths have already been sampled."""
     if not sampled_a or not sampled_b:
         raise ValueError("both routes must contain at least one point")
     best_distance = float("inf")
     best_a = best_b = None
+    if prepared_b is None:
+        b_segments, b_mins, b_maxs = _prepare_sampled_segments(sampled_b)
+    else:
+        b_segments, b_mins, b_maxs = prepared_b
     for a0, a1 in _segments(sampled_a):
-        for b0, b1 in _segments(sampled_b):
+        a_min = np.minimum(a0, a1)
+        a_max = np.maximum(a0, a1)
+        # The distance between axis-aligned bounding boxes is a safe lower
+        # bound. Vectorizing this broad phase avoids a Python loop over every
+        # reserved segment while preserving the exact segment-distance pass.
+        gap = np.maximum(np.maximum(b_mins - a_max, a_min - b_maxs), 0.0)
+        lower_bounds = np.linalg.norm(gap, axis=1)
+        possible = np.flatnonzero(lower_bounds <= best_distance)
+        for index in possible:
+            b0, b1 = b_segments[int(index)]
             distance, witness_a, witness_b = _segment_distance(a0, a1, b0, b1)
             if distance < best_distance:
                 best_distance, best_a, best_b = distance, witness_a, witness_b
@@ -147,6 +169,43 @@ def minimum_centerline_distance(path_a: Any, path_b: Any, sample_step: float = 2
     }
 
 
+def minimum_centerline_distance(path_a: Any, path_b: Any, sample_step: float = 20.0) -> dict[str, Any]:
+    """Find the minimum distance between two sampled centerline polylines."""
+    return _minimum_centerline_distance_sampled(
+        sample_route(path_a, sample_step),
+        sample_route(path_b, sample_step),
+    )
+
+
+def centerline_distance_below(
+    path_a: Any,
+    sampled_path_b: list[list[float]],
+    limit: float,
+    sample_step: float = 20.0,
+    prepared_segments_b=None,
+    sampled_path_a: list[list[float]] | None = None,
+) -> bool:
+    """Return whether two sampled paths have a segment distance below ``limit``."""
+    sampled_a = sampled_path_a if sampled_path_a is not None else sample_route(path_a, sample_step)
+    if not sampled_a or not sampled_path_b:
+        raise ValueError("both routes must contain at least one point")
+    if prepared_segments_b is None:
+        prepared_segments_b = _prepare_sampled_segments(sampled_path_b)
+    b_segments, b_mins, b_maxs = prepared_segments_b
+    threshold = float(limit)
+    for a0, a1 in _segments(sampled_a):
+        a_min = np.minimum(a0, a1)
+        a_max = np.maximum(a0, a1)
+        gap = np.maximum(np.maximum(b_mins - a_max, a_min - b_maxs), 0.0)
+        for index in np.flatnonzero(np.linalg.norm(gap, axis=1) <= threshold):
+            distance, _witness_a, _witness_b = _segment_distance(
+                a0, a1, *b_segments[int(index)]
+            )
+            if distance < threshold:
+                return True
+    return False
+
+
 def check_route_clearance(
     path_a: Any,
     radius_a: float,
@@ -154,6 +213,9 @@ def check_route_clearance(
     radius_b: float,
     required_clearance: float = 0.0,
     sample_step: float = 20.0,
+    sampled_path_a: list[list[float]] | None = None,
+    sampled_path_b: list[list[float]] | None = None,
+    prepared_segments_b=None,
 ) -> dict[str, Any]:
     """Check the gap between two swept pipe envelopes.
 
@@ -177,7 +239,11 @@ def check_route_clearance(
             radius_b = number
         else:
             required_clearance = number
-    report = minimum_centerline_distance(path_a, path_b, sample_step)
+    report = _minimum_centerline_distance_sampled(
+        sampled_path_a if sampled_path_a is not None else sample_route(path_a, sample_step),
+        sampled_path_b if sampled_path_b is not None else sample_route(path_b, sample_step),
+        prepared_b=prepared_segments_b,
+    )
     minimum_clearance = float(report["centerline_min_distance"]) - float(radius_a) - float(radius_b)
     report.update(
         {

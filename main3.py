@@ -168,6 +168,17 @@ def _build_hose_layout_for_route(
         "default_sleeve_radial_clearance_mm": float(getattr(settings, "DEFAULT_SLEEVE_RADIAL_CLEARANCE_MM", 0.0)),
     }
     entries = [dict(item) for item in (pipe_segments or [])]
+    effective_specs = {key: dict(value) for key, value in specs.items()}
+    overrides = dict(params.get("engineering_parameters") or {})
+    core_spec = str(entries[0].get("core_spec", params.get("constraint_profile", {}).get("core_spec", ""))) if entries else ""
+    cover_spec = str(entries[0].get("cover_spec", "")) if entries else ""
+    if core_spec in effective_specs and "metal_outer_diameter" in overrides:
+        effective_specs[core_spec]["outer_diameter"] = float(overrides["metal_outer_diameter"])
+    if cover_spec in effective_specs:
+        for key, value_key in (("material", "hose_material"), ("outer_diameter", "hose_outer_diameter"),
+                               ("wall_thickness", "hose_wall_thickness"), ("minimum_bend_radius", "hose_bend_radius_minimum")):
+            if value_key in overrides:
+                effective_specs[cover_spec][key] = overrides[value_key]
 
     def build_at(center_s: float | None = None) -> dict:
         configured = [dict(item) for item in entries]
@@ -178,7 +189,7 @@ def _build_hose_layout_for_route(
         layout = build_hose_layout(
             length,
             configured,
-            specs,
+            effective_specs,
             engineered_segments,
             **defaults,
         )
@@ -239,7 +250,8 @@ def _build_hose_layout_for_route(
     return best_layout
 
 
-def active_constraint_profile(spec_id: str | None = None, envelope_radius: float | None = None, pipe_segments=None) -> dict:
+def active_constraint_profile(spec_id: str | None = None, envelope_radius: float | None = None,
+                              pipe_segments=None, overrides=None) -> dict:
     """Resolve the selected air-conditioning pipe rules for this run.
 
     Segment assignments are applied along the generated metal-core route.
@@ -250,6 +262,7 @@ def active_constraint_profile(spec_id: str | None = None, envelope_radius: float
     specs = getattr(settings, "PIPE_SPECS", {})
     if spec_id not in specs:
         raise ValueError(f"ACTIVE_PIPE_SPEC is not defined: {spec_id}")
+    overrides = dict(overrides or {})
     spec = dict(specs[spec_id])
     if spec.get("kind") != "metal":
         raise ValueError("ACTIVE_PIPE_SPEC must identify the continuous metal core")
@@ -269,11 +282,9 @@ def active_constraint_profile(spec_id: str | None = None, envelope_radius: float
     # 应用到对应的中心线区间，中心线路径仍按连续金属芯规划。
     # SAAA 半径是最低要求。recommended 仅作搜索参考，并提升到硬下限；
     # preferred 不限制最终半径上限，大转角搜索可以选用更大的统一半径。
-    preferred = max(
-        float(spec.get("recommended_bend_radius", 0.0)),
-        float(spec.get("minimum_bend_radius", 0.0)),
-    )
-    hard_min = float(spec.get("minimum_bend_radius", preferred))
+    preferred = max(float(overrides.get("metal_bend_radius_recommended", spec.get("recommended_bend_radius", 0.0))),
+                    float(overrides.get("metal_bend_radius_minimum", spec.get("minimum_bend_radius", 0.0))))
+    hard_min = float(overrides.get("metal_bend_radius_minimum", spec.get("minimum_bend_radius", preferred)))
     cover_ids = [
         str(segment.get("cover_spec"))
         for segment in (getattr(settings, "PIPE_SEGMENTS", []) if pipe_segments is None else pipe_segments)
@@ -292,9 +303,17 @@ def active_constraint_profile(spec_id: str | None = None, envelope_radius: float
             if envelope_radius is not None
             else getattr(settings, "ROUTE_MAX_ENVELOPE_RADIUS", float(spec["outer_diameter"]) / 2.0)
         ),
-        "core_outer_radius": float(spec["outer_diameter"]) / 2.0,
-        "straight_recommended": spec.get("straight_recommended"),
-        "straight_minimum": spec.get("straight_minimum"),
+        "core_outer_radius": float(overrides.get("metal_outer_diameter", spec["outer_diameter"])) / 2.0,
+        "straight_recommended": overrides.get("straight_recommended", spec.get("straight_recommended")),
+        "straight_minimum": overrides.get("straight_minimum", spec.get("straight_minimum")),
+        "bend_angle_recommended": float(overrides.get("bend_angle_recommended", getattr(settings, "BEND_ANGLE_RECOMMENDED_DEG", 10.0))),
+        "bend_angle_minimum": float(overrides.get("bend_angle_minimum", getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0))),
+        "weld_spacing_recommended": float(overrides.get("weld_spacing_recommended", getattr(settings, "WELD_SPACING_RECOMMENDED", 30.0))),
+        "weld_spacing_minimum": float(overrides.get("weld_spacing_minimum", getattr(settings, "WELD_SPACING_MINIMUM", 25.0))),
+        "valve_straight_recommended": float(overrides.get("valve_straight_recommended", getattr(settings, "VALVE_STRAIGHT_RECOMMENDED", 25.0))),
+        "valve_straight_minimum": float(overrides.get("valve_straight_minimum", getattr(settings, "VALVE_STRAIGHT_MINIMUM", 5.0))),
+        "sleeve_axis_clearance_recommended": float(overrides.get("sleeve_axis_clearance_recommended", getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_RECOMMENDED", 80.0))),
+        "sleeve_axis_clearance_minimum": float(overrides.get("sleeve_axis_clearance_minimum", getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_MINIMUM", 65.0))),
         "spec_ids": spec_ids,
         "pipe_segments": list(getattr(settings, "PIPE_SEGMENTS", []) if pipe_segments is None else pipe_segments),
     }
@@ -400,6 +419,8 @@ def validate_route_constraints(
     profile: dict,
     collision_model=None,
     hose_layout: dict | None = None,
+    metal_segment_groups: list[list[dict]] | None = None,
+    sleeve_specs: list[dict] | None = None,
 ) -> dict:
     """Check the confirmed air-conditioning constraints on one centerline."""
     path = np.asarray(path, dtype=float)
@@ -410,7 +431,10 @@ def validate_route_constraints(
         hard_failures.extend(hose_layout.get("hard_failures", []))
         warnings.extend(hose_layout.get("warnings", []))
 
-    arc_radii = [float(seg.get("radius", 0.0)) for seg in engineered.get("segments", []) if seg.get("type") == "arc"]
+    # Manual editing replaces metal with local hose/sleeve intervals. Its metal
+    # checks must use those actual intervals rather than the continuous planner core.
+    groups = [engineered.get("segments", [])] if metal_segment_groups is None else metal_segment_groups
+    arc_radii = [float(seg.get("radius", 0.0)) for group in groups for seg in group if seg.get("type") == "arc"]
     minimum_radius = min(arc_radii) if arc_radii else None
     if minimum_radius is not None and minimum_radius + 1e-6 < profile["minimum_bend_radius"]:
         hard_failures.append({
@@ -426,9 +450,10 @@ def validate_route_constraints(
         })
 
     # 验收真实成形弯角，不能以控制点已简化代替验收；同圆分弧仍是一个弯。
-    bends = physical_bends(engineered.get("segments", []))
-    minimum_bend_angle = float(getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0))
-    recommended_bend_angle = float(getattr(settings, "BEND_ANGLE_RECOMMENDED_DEG", 10.0))
+    grouped_bends = [(group, physical_bends(group)) for group in groups]
+    bends = [bend for _, items in grouped_bends for bend in items]
+    minimum_bend_angle = float(profile.get("bend_angle_minimum", getattr(settings, "BEND_ANGLE_MINIMUM_DEG", 5.0)))
+    recommended_bend_angle = float(profile.get("bend_angle_recommended", getattr(settings, "BEND_ANGLE_RECOMMENDED_DEG", 10.0)))
     for index, bend in enumerate(bends):
         if bend["angle_deg"] + 1e-6 < minimum_bend_angle:
             hard_failures.append({"rule": "bend_angle", "bend_index": index,
@@ -436,10 +461,10 @@ def validate_route_constraints(
         elif bend["angle_deg"] + 1e-6 < recommended_bend_angle:
             warnings.append({"rule": "bend_angle", "bend_index": index,
                              "actual_deg": bend["angle_deg"], "recommended_deg": recommended_bend_angle})
-    for left, right in zip(bends[:-1], bends[1:]):
+    for group, left, right in ((group, left, right) for group, items in grouped_bends for left, right in zip(items[:-1], items[1:])):
         line_length = sum(
             dist(middle["start"], middle["end"])
-            for middle in engineered["segments"][left["last_segment"] + 1:right["first_segment"]]
+            for middle in group[left["last_segment"] + 1:right["first_segment"]]
             if middle.get("type") == "line"
         )
         required = profile.get("straight_minimum")
@@ -457,10 +482,10 @@ def validate_route_constraints(
     weld_s = sorted(project_point_to_path(point, path)[0] for point in getattr(settings, "WELD_POINTS", []))
     for a, b in zip(weld_s[:-1], weld_s[1:]):
         spacing = b - a
-        if spacing < float(getattr(settings, "WELD_SPACING_MINIMUM", 25.0)):
-            hard_failures.append({"rule": "weld_spacing", "actual_mm": spacing, "minimum_mm": float(getattr(settings, "WELD_SPACING_MINIMUM", 25.0))})
-        elif spacing < float(getattr(settings, "WELD_SPACING_RECOMMENDED", 30.0)):
-            warnings.append({"rule": "weld_spacing", "actual_mm": spacing, "recommended_mm": float(getattr(settings, "WELD_SPACING_RECOMMENDED", 30.0))})
+        if spacing < float(profile.get("weld_spacing_minimum", getattr(settings, "WELD_SPACING_MINIMUM", 25.0))):
+            hard_failures.append({"rule": "weld_spacing", "actual_mm": spacing, "minimum_mm": float(profile.get("weld_spacing_minimum", getattr(settings, "WELD_SPACING_MINIMUM", 25.0)))})
+        elif spacing < float(profile.get("weld_spacing_recommended", getattr(settings, "WELD_SPACING_RECOMMENDED", 30.0))):
+            warnings.append({"rule": "weld_spacing", "actual_mm": spacing, "recommended_mm": float(profile.get("weld_spacing_recommended", getattr(settings, "WELD_SPACING_RECOMMENDED", 30.0)))})
 
     for point in getattr(settings, "VALVE_SEATS", []):
         valve_s, error = project_point_to_path(point, path)
@@ -479,19 +504,20 @@ def validate_route_constraints(
         right_boundaries = [start for start, _end in bend_intervals if start >= valve_s]
         left = valve_s - max(left_boundaries or [0.0])
         right = min(right_boundaries or [path_length(path)]) - valve_s
-        minimum = float(getattr(settings, "VALVE_STRAIGHT_MINIMUM", 5.0))
-        recommended = float(getattr(settings, "VALVE_STRAIGHT_RECOMMENDED", 25.0))
+        minimum = float(profile.get("valve_straight_minimum", getattr(settings, "VALVE_STRAIGHT_MINIMUM", 5.0)))
+        recommended = float(profile.get("valve_straight_recommended", getattr(settings, "VALVE_STRAIGHT_RECOMMENDED", 25.0)))
         for side, distance in (("left", left), ("right", right)):
             if distance < minimum:
                 hard_failures.append({"rule": "valve_straight", "side": side, "actual_mm": distance, "minimum_mm": minimum})
             elif distance < recommended:
                 warnings.append({"rule": "valve_straight", "side": side, "actual_mm": distance, "recommended_mm": recommended})
 
-    sleeve_specs = getattr(settings, "ALUMINUM_SLEEVES", [])
+    sleeve_specs = getattr(settings, "ALUMINUM_SLEEVES", []) if sleeve_specs is None else sleeve_specs
+    sleeve_axis_distances = []
     for sleeve in sleeve_specs:
         spec_id = str(sleeve.get("spec", profile["active_spec"]))
         lengths = getattr(settings, "ALUMINUM_SLEEVE_BACK_LENGTHS", {}).get(spec_id)
-        if lengths is None:
+        if lengths is None or sleeve.get("back_length") is None:
             warnings.append({"rule": "aluminum_sleeve_back_length_missing", "spec": spec_id})
         else:
             actual = float(sleeve.get("back_length", 0.0))
@@ -514,8 +540,8 @@ def validate_route_constraints(
         if collision_model is None:
             warnings.append({"rule": "aluminum_sleeve_clearance_unchecked", "spec": spec_id})
             continue
-        recommended_clearance = float(getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_RECOMMENDED", 80.0))
-        minimum_clearance = float(getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_MINIMUM", 65.0))
+        recommended_clearance = float(profile.get("sleeve_axis_clearance_recommended", getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_RECOMMENDED", 80.0)))
+        minimum_clearance = float(profile.get("sleeve_axis_clearance_minimum", getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_MINIMUM", 65.0)))
         lo_s, hi_s = sorted([float(start_s), float(end_s)])
         path_s = cumulative_lengths(path)
         for index, point in enumerate(path):
@@ -539,6 +565,8 @@ def validate_route_constraints(
                 hard_failures.append({"rule": "aluminum_sleeve_axis_clearance", "actual_mm": best, "minimum_mm": minimum_clearance, "component": best_name})
             elif best < recommended_clearance:
                 warnings.append({"rule": "aluminum_sleeve_axis_clearance", "actual_mm": best, "recommended_mm": recommended_clearance, "component": best_name})
+            if math.isfinite(best):
+                sleeve_axis_distances.append(best)
 
     return {
         "valid": not hard_failures,
@@ -551,6 +579,7 @@ def validate_route_constraints(
         "minimum_actual_bend_angle_deg": min((bend["angle_deg"] for bend in bends), default=None),
         "aluminum_sleeve_axis_clearance_recommended": float(getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_RECOMMENDED", 80.0)),
         "aluminum_sleeve_axis_clearance_minimum": float(getattr(settings, "ALUMINUM_SLEEVE_AXIS_CLEARANCE_MINIMUM", 65.0)),
+        "aluminum_sleeve_axis_clearance_actual": min(sleeve_axis_distances, default=None),
         "hose_layout": hose_layout or {
             "enabled": False,
             "valid": True,
@@ -2145,6 +2174,7 @@ def make_engineering_params(pipe=None, collision_model=None) -> dict:
         spec_id=spec_id,
         envelope_radius=float(radius) if radius is not None else None,
         pipe_segments=value("pipe_segments", None),
+        overrides=value("engineering_parameters", None),
     )
     if radius is None:
         radius = profile["envelope_radius"]
@@ -2182,6 +2212,7 @@ def make_engineering_params(pipe=None, collision_model=None) -> dict:
     )
     return {
         "constraint_profile": profile,
+        "engineering_parameters": dict(value("engineering_parameters", {}) or {}),
         "bend_radius": profile["preferred_bend_radius"],
         "max_bend_angle_deg": float(getattr(settings, "ENGINEERING_MAX_BEND_ANGLE_DEG", 45.0)),
         "min_corner_angle_deg": float(getattr(settings, "ENGINEERING_MAX_BEND_ANGLE_DEG", 90.0)),

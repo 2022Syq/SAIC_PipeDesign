@@ -16,7 +16,9 @@ upload/
 #新的文件夹
 data/input/
 model/
-
+#高压线的参考文件
+/hvwire-route-generation
+/hvwire
 #所有文件
 doc/
 #输出

@@ -1079,22 +1079,86 @@ class DualSectionModel:
                 continue
             from route_clearance import component_paths
             for component in component_paths(route, float(other_radius)):
+                component_points = np.asarray(component["path"], dtype=float)
                 self.reserved_routes.append({
                     "pipe_id": str(other_id),
                     "path": component['path'],
                     "radius": component['radius'],
+                    "bounds": (
+                        np.min(component_points, axis=0),
+                        np.max(component_points, axis=0),
+                    ),
                 })
+        self._reserved_sample_cache: dict[tuple[int, float], tuple[list[list[float]], object]] = {}
         self._point_status_cache: dict[tuple[float, float, float], tuple[bool, bool, tuple[str, ...]]] = {}
         self._segment_check_cache: dict[tuple, dict] = {}
 
     def _reserved_clearance_reports(self, a, b, sample_step: float) -> list[dict]:
         if not self.reserved_routes:
             return []
-        from route_clearance import check_route_clearance
+        from route_clearance import (
+            _prepare_sampled_segments,
+            centerline_distance_below,
+            check_route_clearance,
+            sample_route,
+        )
 
         candidate = [np.asarray(a, dtype=float).tolist(), np.asarray(b, dtype=float).tolist()]
+        candidate_sampled = sample_route(candidate, sample_step)
+        candidate_min = np.minimum(np.asarray(a, dtype=float), np.asarray(b, dtype=float))
+        candidate_max = np.maximum(np.asarray(a, dtype=float), np.asarray(b, dtype=float))
         reports = []
-        for reserved in self.reserved_routes:
+        for index, reserved in enumerate(self.reserved_routes):
+            reserved_min, reserved_max = reserved["bounds"]
+            bbox_gap = np.maximum(
+                np.maximum(reserved_min - candidate_max, candidate_min - reserved_max), 0.0
+            )
+            required_distance = (
+                self.pipe_radius + float(reserved["radius"]) + self.required_clearance
+            )
+            if float(np.linalg.norm(bbox_gap)) > required_distance:
+                bbox_distance = float(np.linalg.norm(bbox_gap))
+                minimum_clearance = bbox_distance - self.pipe_radius - float(reserved["radius"])
+                reports.append({
+                    "valid": True,
+                    "minimum_clearance": minimum_clearance,
+                    "min_clearance": minimum_clearance,
+                    "required_clearance": float(self.required_clearance),
+                    "radius_a": float(self.pipe_radius),
+                    "radius_b": float(reserved["radius"]),
+                    "sample_step": float(sample_step),
+                    "pipe_id_b": reserved["pipe_id"],
+                    "broad_phase_skipped": True,
+                    "distance_mode": "bbox_lower_bound",
+                })
+                continue
+            cache_key = (index, round(float(sample_step), 5))
+            cached = self._reserved_sample_cache.get(cache_key)
+            if cached is None:
+                sampled_path = sample_route(reserved["path"], sample_step)
+                cached = (sampled_path, _prepare_sampled_segments(sampled_path))
+                self._reserved_sample_cache[cache_key] = cached
+            sampled_path, prepared_segments = cached
+            if not centerline_distance_below(
+                candidate,
+                sampled_path,
+                required_distance,
+                sample_step,
+                prepared_segments_b=prepared_segments,
+                sampled_path_a=candidate_sampled,
+            ):
+                reports.append({
+                    "valid": True,
+                    "minimum_clearance": float(self.required_clearance),
+                    "min_clearance": float(self.required_clearance),
+                    "required_clearance": float(self.required_clearance),
+                    "radius_a": float(self.pipe_radius),
+                    "radius_b": float(reserved["radius"]),
+                    "sample_step": float(sample_step),
+                    "pipe_id_b": reserved["pipe_id"],
+                    "distance_mode": "threshold_only",
+                })
+                continue
             report = check_route_clearance(
                 candidate,
                 self.pipe_radius,
@@ -1102,6 +1166,9 @@ class DualSectionModel:
                 reserved["radius"],
                 self.required_clearance,
                 sample_step=max(float(sample_step), 1.0),
+                sampled_path_a=candidate_sampled,
+                sampled_path_b=sampled_path,
+                prepared_segments_b=prepared_segments,
             )
             report["pipe_id_b"] = reserved["pipe_id"]
             reports.append(report)
@@ -2364,6 +2431,7 @@ def plan_pipe_routes(
     pipe=None,
     reserved_routes=None,
     allow_hard_conflicts: bool | None = None,
+    section_cache: tuple[list[dict], list[dict], list[dict], list[dict]] | None = None,
 ) -> dict:
     """Plan one configured pipe against an already-built planning space.
 
@@ -2381,8 +2449,13 @@ def plan_pipe_routes(
     extra_clearance = float(getattr(settings, "MAIN2_EXTRA_CLEARANCE", 0.0))
     if not 0.0 <= extra_clearance <= 20.0:
         raise ValueError("MAIN2_EXTRA_CLEARANCE must be between 0 and 20 mm")
-    x_sections = section_polygons(space, "x", extra_clearance=extra_clearance)
-    y_sections = section_polygons(space, "y", extra_clearance=extra_clearance)
+    if section_cache is None:
+        x_sections = section_polygons(space, "x", extra_clearance=extra_clearance)
+        y_sections = section_polygons(space, "y", extra_clearance=extra_clearance)
+        validation_x_sections = section_polygons(space, "x")
+        validation_y_sections = section_polygons(space, "y")
+    else:
+        x_sections, y_sections, validation_x_sections, validation_y_sections = section_cache
     if not y_sections:
         raise RuntimeError("planning space does not contain y_sections")
     pipe_radius = value(
@@ -2398,8 +2471,8 @@ def plan_pipe_routes(
         required_clearance=required_clearance,
     )
     validation_model = DualSectionModel(
-        section_polygons(space, "x"),
-        section_polygons(space, "y"),
+        validation_x_sections,
+        validation_y_sections,
         reserved_routes=reserved_routes,
         pipe_radius=pipe_radius,
         required_clearance=required_clearance,

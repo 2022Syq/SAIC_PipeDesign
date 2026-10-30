@@ -18,10 +18,12 @@ earlier stages for that pipe.  A stage may write additional files below its
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import math
 import re
+import time
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
@@ -269,6 +271,7 @@ __all__ = [
     "default_export",
     "default_planning",
     "make_run_id",
+    "planning_space_cache_key",
     "run_from_config",
     "run_pipeline",
     "run_multi_pipe",
@@ -302,6 +305,47 @@ def _shared_space_bounds(pipes: list[Any]) -> tuple[list[float], list[float], fl
     goal = [max(point[index] for point in points) for index in range(3)]
     radius = max(_planning_radius(pipe) for pipe in pipes)
     return start, goal, radius
+
+
+def planning_space_cache_key(model_dir: str | Path, pipes: list[Any]) -> str:
+    """Return a key for the CAD and geometric inputs that define a space."""
+    import settings
+
+    model_dir = Path(model_dir).resolve()
+    suffixes = {".igs", ".iges", ".step", ".stp", ".stl"}
+    files = []
+    if model_dir.is_dir():
+        for path in sorted(model_dir.iterdir(), key=lambda item: item.name.lower()):
+            if path.is_file() and path.suffix.lower() in suffixes:
+                stat = path.stat()
+                files.append({
+                    "name": path.name,
+                    "size": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                })
+    start, goal, radius = _shared_space_bounds(pipes)
+    geometry_settings = {
+        name: getattr(settings, name)
+        for name in (
+            "SECTION_WIDTH_Y", "SECTION_CENTER_Y", "SECTION_HEIGHT_ABOVE_GROUND",
+            "SECTION_DX", "SECTION_DY", "X_PADDING_BEFORE_START", "X_PADDING_AFTER_GOAL",
+            "MESH_LINEAR_DEFLECTION", "MESH_ANGULAR_DEFLECTION", "MIN_FREE_REGION_AREA",
+            "POLYGON_SIMPLIFY_TOLERANCE", "SOLID_LOOP_CLOSE_TOLERANCE", "SOLID_MIN_FILL_AREA",
+            "SOLID_FILL_FROM_BUFFER", "DEFAULT_OBSTACLE_CLEARANCE", "DEFAULT_GROUND_CLEARANCE",
+            "DEFAULT_COMPONENT_SOLID", "SPECIAL_COMPONENT_RULES",
+        )
+        if hasattr(settings, name)
+    }
+    payload = {
+        "model_dir": str(model_dir),
+        "files": files,
+        "space_start": start,
+        "space_goal": goal,
+        "planning_radius": radius,
+        "geometry_settings": geometry_settings,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _point_entries(pipe: Any) -> list[tuple[str, list[float]]]:
@@ -713,6 +757,7 @@ def run_multi_pipe(
     catia_visible: bool = False,
     skip_catia: bool = False,
     reuse_space_json: str | Path | None = None,
+    write_html: bool = True,
 ) -> dict[str, Any]:
     """Run the real sequential multi-pipe flow using the existing stages."""
     if isinstance(config_or_path, (str, Path)):
@@ -731,8 +776,10 @@ def run_multi_pipe(
     from main2 import DualSectionModel, export_html as export_guide_html, plan_pipe_routes, section_polygons
     from main3 import engineer_pipe_route, export_engineering_html
     from main4 import create_catia_part
+    import settings
 
     space_start, space_goal, shared_radius = _shared_space_bounds(pipes)
+    space_cache_key = planning_space_cache_key(settings.BASE_STEP_DIR, pipes)
     resolved_run_id = _safe_component(run_id or make_run_id())
     run_dir = Path(output_root).resolve() / resolved_run_id
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -749,6 +796,7 @@ def run_multi_pipe(
             "goal_bound": space_goal,
             "max_outer_radius": shared_radius,
         },
+        "space_cache_key": space_cache_key,
         "point_conflicts": point_conflicts,
         "pipes": [],
     }
@@ -760,29 +808,63 @@ def run_multi_pipe(
 
     try:
         with _temporary_run_settings(run_dir, space_start, space_goal, shared_radius):
+            space_started = time.perf_counter()
             reused_space_path = None
             if reuse_space_json is None:
                 space = build_shared_space(space_start, space_goal, shared_radius, run_dir)
+                _write_json(run_dir / "planning_space.cache.json", {
+                    "cache_key": space_cache_key,
+                    "space_json": str(run_dir / "planning_space.json"),
+                })
             else:
                 space_path = Path(reuse_space_json).resolve()
                 if not space_path.is_file():
                     raise FileNotFoundError(f"reused planning space JSON not found: {space_path}")
+                cache_path = space_path.with_name("planning_space.cache.json")
+                if not cache_path.is_file():
+                    raise ValueError(
+                        "reused planning space has no cache manifest; rebuild it once before reuse"
+                    )
+                cache_record = json.loads(cache_path.read_text(encoding="utf-8"))
+                if cache_record.get("cache_key") != space_cache_key:
+                    raise ValueError(
+                        "reused planning space does not match the current CAD model, endpoints, or space settings"
+                    )
                 print(f"[SPACE] reusing completed planning space: {space_path}", flush=True)
                 space = json.loads(space_path.read_text(encoding="utf-8"))
                 space["source_json"] = str(space_path)
                 reused_space_path = space_path
-            import settings
-
             if reused_space_path is not None:
                 # Engineering distance profiles read settings.SPACE_JSON;
                 # point it at the completed source when no copy is created.
                 settings.SPACE_JSON = reused_space_path
 
-            validation_extra = float(getattr(settings, "ENGINEERING_VALIDATION_EXTRA_CLEARANCE", 2.0))
-            collision_sections = (
-                section_polygons(space, "x", extra_clearance=validation_extra),
-                section_polygons(space, "y", extra_clearance=validation_extra),
+            planning_extra = float(getattr(settings, "MAIN2_EXTRA_CLEARANCE", 0.0))
+            section_cache = (
+                section_polygons(space, "x", extra_clearance=planning_extra),
+                section_polygons(space, "y", extra_clearance=planning_extra),
+                section_polygons(space, "x"),
+                section_polygons(space, "y"),
             )
+            space_elapsed = time.perf_counter() - space_started
+            manifest["timing"] = {
+                "shared_space_seconds": float(space_elapsed),
+                "shared_space_reused": bool(reused_space_path is not None),
+            }
+            print(
+                f"[TIMING] shared_space_seconds={space_elapsed:.1f} "
+                f"reused={bool(reused_space_path is not None)}",
+                flush=True,
+            )
+
+            validation_extra = float(getattr(settings, "ENGINEERING_VALIDATION_EXTRA_CLEARANCE", 2.0))
+            if abs(validation_extra) <= 1e-12:
+                collision_sections = section_cache[2:]
+            else:
+                collision_sections = (
+                    section_polygons(space, "x", extra_clearance=validation_extra),
+                    section_polygons(space, "y", extra_clearance=validation_extra),
+                )
             for index, pipe in enumerate(pipes):
                 pipe_id = _pipe_id(pipe, index)
                 pipe_dir = run_dir / pipe_id
@@ -821,6 +903,11 @@ def run_multi_pipe(
                 }
                 manifest["pipes"].append(record)
 
+                # Publish the current pipe before a potentially long route search.
+                _write_json(run_dir / "manifest.json", manifest)
+
+                pipe_started = time.perf_counter()
+                planning_started = pipe_started
                 planning_error = None
                 try:
                     planning_kwargs = {}
@@ -828,10 +915,13 @@ def run_multi_pipe(
                         planning_kwargs["reserved_routes"] = reserved
                     if _accepts_keyword(plan_pipe_routes, "allow_hard_conflicts"):
                         planning_kwargs["allow_hard_conflicts"] = False
+                    if _accepts_keyword(plan_pipe_routes, "section_cache"):
+                        planning_kwargs["section_cache"] = section_cache
                     planning_result = plan_pipe_routes(space, pipe, **planning_kwargs)
                 except Exception as exc:
                     planning_error = f"planning failed: {exc}"
                     planning_result = {"routes": [], "error": planning_error}
+                planning_elapsed = time.perf_counter() - planning_started
                 _write_pipe_result(pipe_dir, "planning", planning_result)
                 selected_guide = None
                 selected_engineered = None
@@ -957,6 +1047,8 @@ def run_multi_pipe(
                             diagnostic_kwargs["reserved_routes"] = reserved
                         if _accepts_keyword(plan_pipe_routes, "allow_hard_conflicts"):
                             diagnostic_kwargs["allow_hard_conflicts"] = True
+                        if _accepts_keyword(plan_pipe_routes, "section_cache"):
+                            diagnostic_kwargs["section_cache"] = section_cache
                         try:
                             diagnostic_planning = plan_pipe_routes(
                                 space, pipe, **diagnostic_kwargs
@@ -1094,7 +1186,16 @@ def run_multi_pipe(
                         "当前固定顺序已穷尽本管路搜索；请示后再考虑调整管路顺序"
                         if not selected_formal else None
                     ),
+                    "timing_seconds": {
+                        "planning": float(planning_elapsed),
+                        "total": float(time.perf_counter() - pipe_started),
+                    },
                 })
+                print(
+                    f"[TIMING] {pipe_id} planning_seconds={planning_elapsed:.1f} "
+                    f"total_seconds={record['timing_seconds']['total']:.1f}",
+                    flush=True,
+                )
                 guide_routes.append(selected_guide)
                 engineered_routes.append(selected_engineered)
                 clearance_reports.extend(selected_reports or [])
@@ -1133,8 +1234,11 @@ def run_multi_pipe(
             _write_json(run_dir / "routes_engineered.json", engineered_result)
             _write_json(run_dir / "validation.json", {"reports": clearance_reports,
                                                        "double_clamp_reports": double_reports})
-            export_guide_html(guide_routes, run_dir / "routes_guide.html")
-            export_engineering_html(engineered_result, run_dir / "multi_route_engineered.html")
+            # The workbench renders the final engineered data itself. Avoid
+            # loading the full CAD model twice to create unused static viewers.
+            if write_html:
+                export_guide_html(guide_routes, run_dir / "routes_guide.html")
+                export_engineering_html(engineered_result, run_dir / "multi_route_engineered.html")
 
             blocked = [
                 record for record in manifest["pipes"]

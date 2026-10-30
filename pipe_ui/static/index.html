@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>空调管路 · 建模工作台</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#inspector">跳到管路参数</a>
+  <header><div class="brand"><span class="brand-icon" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M5 24V14a6 6 0 0 1 6-6h2a6 6 0 0 1 6 6v4a6 6 0 0 0 6 6h2" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></span><div><h1>空调管路</h1><span>建模工作台</span></div></div>
+    <ol id="steps" aria-label="工作流程"><li class="active"><button id="configureStep" title="查看模型与规格">1 <span>模型与规格</span></button></li><li>2 <span>路径规划</span></li><li><button id="resultStep" disabled title="完成规划后可进入">3 <span>微调与导出</span></button></li></ol>
+    <button id="openProject" class="quiet">打开已保存工程</button>
+  </header>
+  <main>
+    <aside id="sidebar">
+      <div id="sidebarContext">
+      <section id="projectSummary"><details id="projectDetails" open><summary><span>工程来源</span><span id="modelSummary">读取中</span><span id="projectState" class="tag">读取中</span></summary><div class="project-content"><dl class="project-meta"><dt>环境</dt><dd id="modelName">正在读取…</dd><dt>管路点</dt><dd id="pointSource">尚未读取</dd></dl><p id="resultState" class="hint" hidden></p></div></details></section>
+      <section id="planningPanel" hidden><div class="section-head"><h2>正在规划路径</h2><span id="elapsed" class="tag" role="timer" aria-live="off">已运行 0 秒</span></div><p id="planningProgress" role="status">正在准备规划…</p><p class="hint">完成后自动进入微调与导出，结果自动保存。</p></section>
+      <section id="inputPanel"><div class="section-head"><h2>工程输入</h2></div>
+        <div class="button-row"><button id="chooseModel">选择环境模型</button><button id="readCatia">读取 CATIA 管路点</button></div>
+        <p class="hint">读取管路点前，请在 CATIA 中打开包含命名点组的零件。</p>
+        <p id="inputHint" class="hint">选择环境模型，读取命名点组后设置每根管的规格。</p>
+      </section>
+      <section id="pipePanel"><div class="section-head"><h2>选择管路 <span id="pipeCount" class="count">0</span></h2><span id="modeLabel" class="tag">规格设置</span></div>
+        <div id="pipeList"></div>
+      </section>
+      </div>
+      <section id="editPanel" hidden>
+        <div class="section-head"><h2>画面微调</h2><button id="hangerDemo" class="quiet small">修改挂点 · 演示</button></div>
+        <p id="editTarget" class="edit-target">请点击选择编辑管路</p>
+        <div class="segmented" role="group" aria-label="编辑模式"><button id="routeMode" class="active" aria-pressed="true">管路路径</button><button id="hoseMode" aria-pressed="false">胶管长度 / 位置</button></div>
+        <p id="editHint" class="hint">点击管路选点，再拖动 X、Y、Z 轴。起终点、接口方向和挂点固定。</p>
+        <label id="influenceLabel" class="range-label">局部影响范围 <input id="influence" type="range" min="30" max="600" step="10" value="200"><output id="influenceValue">200 mm</output></label>
+        <div id="pendingInfo" class="pending-info" hidden>当前为拖动预览，应用后更新参数和警告。</div>
+        <div class="button-row"><button id="applyEdit" class="primary" disabled>应用微调</button><button id="discardEdit" disabled>取消本次</button></div>
+      </section>
+      <div id="inspector" tabindex="-1" role="region" aria-label="管路参数与检查">
+      <section id="parametersPanel"><div class="section-head inspector-heading"><h2 id="parameterTitle">管路参数</h2><span class="muted">长度单位 mm</span></div>
+        <p id="parameterHint" class="hint">将鼠标移到管路上，查看对应参数。</p>
+        <dl id="keyParameters" class="key-parameters"></dl>
+        <details id="allParameters" open><summary>完整参数与工艺要求 <span class="edit-badge">可编辑</span></summary>
+        <table class="parameters"><colgroup><col style="width:40%"><col style="width:23%"><col style="width:18%"><col style="width:19%"></colgroup><thead><tr><th>参数</th><th>实际 / 选定</th><th>推荐</th><th>极限</th></tr></thead><tbody id="parameters"></tbody></table>
+        <p class="source-note">规范来源：SAAA 工艺要求（2026-07-06）。规格设置阶段可直接修改“实际 / 选定、推荐、极限”；生成路线后的几何实测值由系统锁定。未提供 ≠ 已通过。</p>
+        </details>
+        <details><summary>马鞍规格参考</summary><p class="hint">当前未提供马鞍选型及实际尺寸。</p><table class="saddles"><thead><tr><th>型号</th><th>a</th><th>b</th><th>c</th><th>d 极限</th><th>d 推荐</th></tr></thead><tbody id="saddles"></tbody></table></details>
+      </section>
+      <section id="warningsPanel" hidden><div class="section-head"><h2>约束警告</h2><span id="warningCount" class="count warning"></span></div>
+        <p class="hint">提醒允许继续编辑和导出；缺少数据单独列出，不判定为合格。</p><div id="warnings"></div>
+      </section>
+      </div>
+      <div class="sidebar-bottom"><p id="operationError" role="alert" hidden></p><p id="exportState" class="hint" hidden></p><button id="plan" class="primary full">生成规划</button><button id="exportCatia" class="primary full" hidden>导出全部 CATPart</button><button id="showFolder" class="quiet full" hidden>打开保存目录</button></div>
+    </aside>
+    <section id="viewer" aria-label="三维管路编辑视图">
+      <canvas id="modelScene"></canvas><canvas id="scene" aria-label="管路拖动操作画布"></canvas>
+      <div class="viewer-top"><div><span id="sceneTitle" class="scene-title">模型与端点</span><span id="sceneSubtitle">先选规格，再生成路线</span></div><div class="view-buttons"><button id="fit">适应视图</button><button id="iso">立体</button><button id="xy">俯视</button><button id="xz">正视</button><button id="yz">侧视</button></div></div>
+      <div id="modelStatus" role="status">正在读取环境模型…</div>
+      <div id="emptyHint" class="empty-hint" hidden>读取管路点后，这里会显示每根管的起点与终点。</div>
+      <div id="pickInfo" class="pick-info" hidden></div>
+      <div class="navigation">拖动空白处旋转 · 中键平移 · 滚轮缩放 · Esc 取消拖动</div>
+    </section>
+  </main>
+  <footer><span id="indicator"></span><span id="status" role="status">正在连接本地工作台…</span></footer>
+  <dialog id="sourceDialog" aria-labelledby="sourceDialogTitle"><h2 id="sourceDialogTitle">选择 CATIA 管路点组</h2><p class="hint">选择同一零件中需要规划的点组，软件按完整起终点与方向点识别管路。</p><div id="sourceList"></div><div class="button-row"><button id="sourceConfirm" class="primary">读取所选点组</button><button id="sourceCancel">取消</button></div></dialog>
+  <dialog id="demoDialog" aria-labelledby="demoDialogTitle"><h2 id="demoDialogTitle">修改挂点</h2><p>此入口仅用于演示。当前版本保持挂点位置与约束不变。</p><button id="demoClose">知道了</button></dialog>
+  <script src="/viewport.js"></script><script src="/interaction.js"></script><script src="/app.js"></script>
+</body>
+</html>

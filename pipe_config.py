@@ -208,6 +208,10 @@ class PipeInstance:
     allow_direct_guide_modeling: bool = False
     pipe_segments: tuple[Mapping[str, Any], ...] = ()
     double_clamp_constraints: tuple[Mapping[str, Any], ...] = ()
+    # Per-pipe engineering values edited in the workbench.  The specification
+    # catalogue remains the default; this mapping records deliberate overrides
+    # without mutating the shared settings table.
+    engineering_parameters: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.pipe_id, str) or not self.pipe_id.strip():
@@ -254,6 +258,9 @@ class PipeInstance:
                 raise ValueError(f"double_clamp_constraints[{index}] must be an object")
             normalized_clamps.append(dict(constraint))
         object.__setattr__(self, "double_clamp_constraints", tuple(normalized_clamps))
+        if not isinstance(self.engineering_parameters, Mapping):
+            raise ValueError("engineering_parameters must be an object")
+        object.__setattr__(self, "engineering_parameters", dict(self.engineering_parameters))
         if self.start == self.start_dir:
             raise ValueError("start_dir must differ from start")
         if self.goal == self.goal_dir:
@@ -261,7 +268,9 @@ class PipeInstance:
 
     @property
     def outer_radius(self) -> float:
-        radius = spec_outer_radius(self.pipe_spec)
+        overrides = self.engineering_parameters
+        core_diameter = overrides.get("metal_outer_diameter", settings.PIPE_SPECS[self.pipe_spec]["outer_diameter"])
+        radius = _number(core_diameter, "engineering_parameters.metal_outer_diameter", minimum=0.0) / 2.0
         # Keep the largest local component envelope for hose/sleeve geometry.
         # Centerline planning uses ``planning_radius`` so a local hose does
         # not enlarge every section of the shared route space.
@@ -269,7 +278,9 @@ class PipeInstance:
             cover_spec = segment.get("cover_spec")
             if not cover_spec:
                 continue
-            cover_radius = spec_outer_radius(str(cover_spec))
+            cover_id = str(cover_spec)
+            cover_diameter = overrides.get("hose_outer_diameter", settings.PIPE_SPECS[cover_id]["outer_diameter"])
+            cover_radius = _number(cover_diameter, "engineering_parameters.hose_outer_diameter", minimum=0.0) / 2.0
             clearance = _number(
                 segment.get(
                     "sleeve_radial_clearance_mm",
@@ -290,7 +301,10 @@ class PipeInstance:
         segment follow a 9 mm metal route without expanding every section of
         the shared planning space.
         """
-        return spec_outer_radius(self.pipe_spec)
+        diameter = self.engineering_parameters.get(
+            "metal_outer_diameter", settings.PIPE_SPECS[self.pipe_spec]["outer_diameter"]
+        )
+        return _number(diameter, "engineering_parameters.metal_outer_diameter", minimum=0.0) / 2.0
 
     @property
     def radius(self) -> float:
@@ -323,6 +337,7 @@ class PipeInstance:
             allow_direct_guide_modeling=value.get("allow_direct_guide_modeling", False),
             pipe_segments=value.get("pipe_segments", ()),
             double_clamp_constraints=value.get("double_clamp_constraints", ()),
+            engineering_parameters=value.get("engineering_parameters", {}),
         )
 
 

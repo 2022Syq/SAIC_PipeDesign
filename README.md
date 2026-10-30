@@ -2,6 +2,11 @@
 
 This project generates candidate exhaust pipe routes inside an automotive chassis package space.
 
+## 空调管路建模工作台
+
+双击 `启动管路工作台.cmd`，在浏览器中完成模型与端点读取、规格选择、自动规划、
+管路与胶管拖动微调，以及 CATPart 导出。使用方法和验证边界见 [工作台说明](pipe_ui/README.md)。
+
 The workflow has these stages:
 
 1. `upload.py` converts uploaded CATIA Part files under `upload/` to IGES files under `base/`.

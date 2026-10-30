@@ -13,6 +13,7 @@ from multi_pipeline import (
     _point_conflict_reports,
     _double_clamp_reports,
     cli_main,
+    planning_space_cache_key,
     run_pipeline,
 )
 from main4 import create_catia_part
@@ -172,6 +173,26 @@ def test_channel_report_exposes_available_required_and_gap_widths():
     assert report["available_width_mm"] == pytest.approx(20.0)
     assert report["required_width_mm"] == pytest.approx(8.0)
     assert report["gap_mm"] == pytest.approx(12.0)
+
+
+def test_planning_space_cache_key_tracks_cad_and_space_inputs(tmp_path):
+    source = tmp_path / "body.igs"
+    source.write_text("v1", encoding="utf-8")
+    pipe = SimpleNamespace(
+        pipe_id="A",
+        start=[0.0, 0.0, 0.0],
+        goal=[100.0, 0.0, 0.0],
+        planning_radius=4.5,
+    )
+
+    first = planning_space_cache_key(tmp_path, [pipe])
+    source.write_text("version-two", encoding="utf-8")
+    changed_model = planning_space_cache_key(tmp_path, [pipe])
+    moved_pipe = SimpleNamespace(**{**vars(pipe), "goal": [101.0, 0.0, 0.0]})
+    changed_space = planning_space_cache_key(tmp_path, [moved_pipe])
+
+    assert first != changed_model
+    assert first != changed_space
 
 
 def test_double_clamp_report_keeps_angle_details_and_reads_local_radii():
